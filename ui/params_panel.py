@@ -273,6 +273,14 @@ class ParamsPanel(QWidget):
         ff.addRow("Shift:",          self.foopsi_shift)
         self.run_foopsi_btn = QPushButton("Run foopsi")
         self.run_foopsi_btn.setEnabled(False)
+        self.run_foopsi_btn.setToolTip(
+            "Run constrained foopsi / OASIS on every cell (or only the current\n"
+            "cell if 'Current cell only' is checked below).\n"
+            "  • Single cell: runs synchronously, updates the trace immediately.\n"
+            "  • All cells: spawns a background worker with a progress dialog;\n"
+            "    parallelised across cells via joblib threads (~0.5–1 s/cell with OASIS).\n"
+            "Fails fast with a friendly install hint if the selected solver isn't installed."
+        )
         ff.addRow(self.run_foopsi_btn)
         v.addWidget(foopsi_group)
 

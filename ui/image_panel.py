@@ -62,9 +62,11 @@ class ImagePanel(QWidget):
         self.metric_combo.addItems(self.METRICS)
         self.metric_combo.setToolTip(
             "Color each cell's contour by a per-cell metric.\n"
-            "  • None  — single color (no colorbar)\n"
-            "  • SNR / CNN / r-values — CaImAn-derived quality metrics\n"
-            "  • SNR2 / firing_stab / noise / skewness / peaks_ave — derived in proc init"
+            "  • None  — accepted cells green, rejected red (no colorbar).\n"
+            "  • SNR (CaImAn) / CNN / R values — CaImAn-derived quality metrics.\n"
+            "  • SNR2 / Firing stability — derived during proc init (peaks_ave/noise,\n"
+            "    and a peak-rate firing-stability score).\n"
+            "Color scale auto-ranges to the 0.5–99.5 percentile of finite values."
         )
         row.addWidget(self.metric_combo)
 
@@ -85,11 +87,15 @@ class ImagePanel(QWidget):
         self.bkg_combo.addItems(self.BKG_MODES)
         self.bkg_combo.setToolTip(
             "Background image behind the contours.\n"
-            "  • Components    — sum of footprints A[:, cells]\n"
-            "  • Weighted comp — footprints weighted by each cell's mean denoised trace\n"
-            "                    (A_sub @ mean(C, axis=1)) — emphasises active cells\n"
-            "  • W comp + bkg  — weighted comp PLUS CaImAn's spatial background\n"
-            "                    (b @ mean(f, axis=1))"
+            "  • Components    — sum of footprints, sum(A[:, cells], axis=1).\n"
+            "                    Every cell appears equally bright; useful for ROI placement.\n"
+            "  • Weighted comp — |A[:, cells] @ mean(C)| — each cell scaled by its mean\n"
+            "                    activity; the absolute value is taken so cells stay\n"
+            "                    bright regardless of baseline sign (CaImAn-Python ships\n"
+            "                    baseline-subtracted C).\n"
+            "  • W comp + bkg  — weighted comp + CaImAn's spatial background\n"
+            "                    (b @ mean(f)) — shows components on top of the\n"
+            "                    structural FOV; color range clipped to 1–99.5%."
         )
         row.addWidget(self.bkg_combo)
         row.addStretch()
@@ -117,7 +123,10 @@ class ImagePanel(QWidget):
         self.accepted_label = QLabel("Accepted (0)")
         self.accepted_label.setToolTip(
             "Composite footprint of all currently accepted cells.\n"
-            "Click a contour to jump to that cell."
+            "  • Left-click a contour to jump to that cell.\n"
+            "  • Right-click a contour to toggle its accept/reject state\n"
+            "    (also flags the cell as manually overridden).\n"
+            "Clicks are ignored while Pan/Zoom is active in the toolbar."
         )
         header.addWidget(self.accepted_label)
         header.addStretch()
@@ -148,7 +157,10 @@ class ImagePanel(QWidget):
         self.rejected_label = QLabel("Rejected (0)")
         self.rejected_label.setToolTip(
             "Composite footprint of all currently rejected cells.\n"
-            "Click a contour to jump to that cell."
+            "  • Left-click a contour to jump to that cell.\n"
+            "  • Right-click a contour to toggle its accept/reject state\n"
+            "    (also flags the cell as manually overridden).\n"
+            "Clicks are ignored while Pan/Zoom is active in the toolbar."
         )
         header.addWidget(self.rejected_label)
         header.addStretch()

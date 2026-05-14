@@ -140,10 +140,18 @@ class MergePanel(QWidget):
             self.method_combo.addItem(m)
         self.method_combo.setToolTip(
             "How to act on identified duplicate pairs:\n"
-            "  • choose best snr — reject the lower-SNR2 cell of each pair (recommended,\n"
-            "    reversible, no new components added).\n"
-            "  • weighted ave / full mean corr / svd / nmf — create a new merged component\n"
-            "    (not yet implemented in the Python port; ported from MATLAB f_cs_find_similar_comp_core)."
+            "  • choose best snr — reject the lower-SNR2 cell of each pair (reversible,\n"
+            "    no new components added; recommended for quick triage).\n"
+            "  • weighted ave   — combine the two cells' spatial / temporal traces by\n"
+            "    their L2 norms; trace gets a footprint-sum-weighted average.\n"
+            "  • full mean corr — outer product of summed footprints × normalised\n"
+            "    combined trace; emphasises spatial correlation structure.\n"
+            "  • svd            — first SVD component of the per-pixel outer product\n"
+            "    matrix (cleanest decomposition when traces are highly correlated).\n"
+            "  • nmf            — non-negative MF of the rectified outer product\n"
+            "    (requires scikit-learn).\n\n"
+            "The latter four CREATE a new cell, recompute all proc metrics + foopsi for it,\n"
+            "and reject both original cells. Mirrors MATLAB f_cs_find_similar_comp_core."
         )
 
         self.spatial_thr = QDoubleSpinBox()
@@ -227,9 +235,13 @@ class MergePanel(QWidget):
         self.apply_btn = QPushButton("Apply merge")
         self.apply_btn.setEnabled(False)
         self.apply_btn.setToolTip(
-            "Act on the pairs above using the selected method.\n"
-            "For 'choose best snr' this rejects the lower-SNR2 cell of each pair\n"
-            "and flags it as manually overridden."
+            "Act on every pair above using the selected method.\n"
+            "  • choose best snr: rejects the lower-SNR2 cell of each pair and\n"
+            "    flags it as manually overridden.\n"
+            "  • weighted ave / full mean corr / svd / nmf: appends a new merged\n"
+            "    cell per pair, recomputes its metrics (noise, peaks, AR coeffs,\n"
+            "    firing stability) and foopsi, then rejects both original cells.\n"
+            "The Result column fills in with the kept cell ID per row."
         )
         self.apply_btn.clicked.connect(self._on_apply)
 
