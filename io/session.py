@@ -1,10 +1,11 @@
 """Save and load curation sessions as HDF5.
 
 Two file types, both HDF5:
-  - Full session (*.csort.h5):  est + proc + ops, self-contained — no source HDF5 needed.
-  - Ops only    (*.csort_ops.h5): only the /ops group, for sharing params across sessions.
+  - Full session (*.h5):    est + proc + ops, self-contained — no source HDF5 needed.
+  - Ops only    (*_ops.h5): only the /ops group, for sharing params across sessions.
 
-File detection via root attribute /format ∈ { 'caiman_sorter_session', 'caiman_sorter_ops' }.
+File detection via root attribute /format ∈ { 'caiman_sorter_session', 'caiman_sorter_ops' }
+— filenames don't have to end in any specific suffix; the format attribute is authoritative.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import h5py
 import numpy as np
 from scipy.sparse import csc_matrix
 
+from caiman_sorter_py import __version__
 from caiman_sorter_py.core.state import (
     DeconvParams, DeconvResults, Estimates, EvalParamsCaiman,
     EvalParamsReject, MergeParams, Ops, Proc, SmoothDfdtParams, SpikesParams,
@@ -24,7 +26,6 @@ from caiman_sorter_py.core.state import (
 
 FORMAT_SESSION = "caiman_sorter_session"
 FORMAT_OPS     = "caiman_sorter_ops"
-VERSION        = "1"
 
 
 # ----------------------------------------------------------------------
@@ -37,7 +38,7 @@ def save_session(path: str | Path, est: Estimates, proc: Proc, ops: Ops,
     path = Path(path)
     with h5py.File(path, "w") as f:
         f.attrs["format"]      = FORMAT_SESSION
-        f.attrs["version"]     = VERSION
+        f.attrs["app_version"] = __version__
         f.attrs["saved_at"]    = datetime.now().isoformat(timespec="seconds")
         f.attrs["source_path"] = str(source_path)
 
@@ -71,9 +72,9 @@ def save_ops(path: str | Path, ops: Ops) -> None:
     """Save only the Ops dataclass to a small HDF5 file."""
     path = Path(path)
     with h5py.File(path, "w") as f:
-        f.attrs["format"]   = FORMAT_OPS
-        f.attrs["version"]  = VERSION
-        f.attrs["saved_at"] = datetime.now().isoformat(timespec="seconds")
+        f.attrs["format"]      = FORMAT_OPS
+        f.attrs["app_version"] = __version__
+        f.attrs["saved_at"]    = datetime.now().isoformat(timespec="seconds")
         _write_ops(f.create_group("ops"), ops)
 
 
@@ -136,6 +137,14 @@ def _write_est(g: h5py.Group, est: Estimates) -> None:
         g.create_dataset("neurons_sn", data=np.asarray(est.neurons_sn))
     if est.sn is not None:
         g.create_dataset("sn", data=np.asarray(est.sn))
+    # Spatial / temporal background — needed to reconstruct the "W comp + bkg"
+    # image when re-displaying a saved session.
+    if est.b is not None:
+        g.create_dataset("b", data=np.asarray(est.b),
+                         compression="gzip", chunks=True)
+    if est.f is not None:
+        g.create_dataset("f", data=np.asarray(est.f),
+                         compression="gzip", chunks=True)
 
     # AR coefficient matrix from the original file
     g.create_dataset("g", data=np.asarray(est.g))
@@ -153,6 +162,8 @@ def _read_est(g: h5py.Group, init_params: dict, eval_params: dict) -> Estimates:
 
     nsn = np.asarray(g["neurons_sn"][:]) if "neurons_sn" in g else None
     sn  = np.asarray(g["sn"][:]) if "sn" in g else None
+    bb  = np.asarray(g["b"][:])  if "b"  in g else None
+    bg_f = np.asarray(g["f"][:]) if "f"  in g else None
 
     # Recompute contours from A using the threshold stored in ops (or default 0.01).
     contours = None
@@ -177,6 +188,8 @@ def _read_est(g: h5py.Group, init_params: dict, eval_params: dict) -> Estimates:
         idx_components_bad=np.asarray(g["idx_components_bad"][:]),
         contours=contours,
         sn=sn,
+        b=bb,
+        f=bg_f,
         neurons_sn=nsn,
         eval_params_caiman=eval_params or None,
         init_params_caiman=init_params or None,

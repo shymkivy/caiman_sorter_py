@@ -206,7 +206,7 @@ class Ops:
     merge: MergeParams = field(default_factory=MergeParams)
     load_caiman_rejected: bool = False   # include CaImAn-rejected components on load
     save_tag: str = "_sort"              # string appended to source stem in default save names
-    save_as_mat: bool = False            # also write a MATLAB-compatible .mat alongside .csort.h5
+    save_as_mat: bool = False            # also write a MATLAB-compatible .mat alongside the .h5 save
     contour_thr: float = 0.01            # amplitude threshold for contour tracing (fraction of peak)
     browse_path: str = ""
     ops_path: str = ""

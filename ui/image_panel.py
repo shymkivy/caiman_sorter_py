@@ -30,6 +30,12 @@ class ImagePanel(QWidget):
         self._contour_lines: list = []
         self._accepted_im = None
         self._rejected_im = None
+        # Cached MATLAB-equivalent background pieces:
+        #   _bkg_comp_weights : (n_cells,) per-cell mean denoised activity
+        #   _bkg_bg_img       : (h, w)   spatial-background contribution (b @ mean(f))
+        # Both are computed once on data_loaded and reused for every refresh.
+        self._bkg_comp_weights = None
+        self._bkg_bg_img       = None
         self._build_ui()
         self._connect_session()
 
@@ -79,10 +85,11 @@ class ImagePanel(QWidget):
         self.bkg_combo.addItems(self.BKG_MODES)
         self.bkg_combo.setToolTip(
             "Background image behind the contours.\n"
-            "  • Max projection      — bright pixels = strong components\n"
-            "  • Mean image          — average activity\n"
-            "  • Correlation image   — spatially correlated activity (slower to compute)\n"
-            "  • Off                 — black background only"
+            "  • Components    — sum of footprints A[:, cells]\n"
+            "  • Weighted comp — footprints weighted by each cell's mean denoised trace\n"
+            "                    (A_sub @ mean(C, axis=1)) — emphasises active cells\n"
+            "  • W comp + bkg  — weighted comp PLUS CaImAn's spatial background\n"
+            "                    (b @ mean(f, axis=1))"
         )
         row.addWidget(self.bkg_combo)
         row.addStretch()
@@ -162,7 +169,7 @@ class ImagePanel(QWidget):
     # ------------------------------------------------------------------
 
     def _connect_session(self) -> None:
-        self.session.add_listener("data_loaded", self.refresh_images)
+        self.session.add_listener("data_loaded", self._on_data_loaded)
         self.session.add_listener("cell_selected", self.highlight_cell)
         self.session.add_listener("cell_accepted_changed", self.update_cell_toggle)
         self.session.add_listener("cells_reevaluated", self.refresh_images)
@@ -175,10 +182,17 @@ class ImagePanel(QWidget):
     # Public update methods
     # ------------------------------------------------------------------
 
+    def _on_data_loaded(self) -> None:
+        """Invalidate the bkg cache so it's rebuilt for the new dataset."""
+        self._bkg_comp_weights = None
+        self._bkg_bg_img       = None
+        self.refresh_images()
+
     def refresh_images(self) -> None:
         """Rebuild both composite images from scratch."""
         if self.session.est is None:
             return
+        self._ensure_bkg_cache()
         self._clear_axes()
         self._draw_backgrounds()
         self._draw_all_contours()
@@ -234,24 +248,76 @@ class ImagePanel(QWidget):
             ax.set_position([0, 0, 1, 1])   # restore after cla() resets it
             self._style_ax(ax)
 
+    def _ensure_bkg_cache(self) -> None:
+        """Pre-compute per-cell weights and the spatial-background image once.
+
+        Mirrors MATLAB f_cs_initialize_GUI_params.m:
+            bkg_comp_weights = mean(est.C, 2)               % (n_cells, 1)
+            bkg_bgkcomp      = reshape(mean(est.f) * est.b, dims)
+        """
+        est = self.session.est
+        if est is None:
+            return
+        n_cells = est.C.shape[0]
+        if self._bkg_comp_weights is None or len(self._bkg_comp_weights) != n_cells:
+            self._bkg_comp_weights = np.mean(est.C, axis=1)
+        if self._bkg_bg_img is None:
+            self._bkg_bg_img = self._compute_bg_component_image(est)
+
+    @staticmethod
+    def _compute_bg_component_image(est) -> np.ndarray | None:
+        """Return CaImAn's spatial-background contribution as a (h, w) image.
+
+            img = (b @ mean(f, axis=1)).reshape(dims, order='F')
+        Returns None when b or f are absent.
+        """
+        if est.b is None or est.f is None or not est.dims:
+            return None
+        b = np.asarray(est.b)
+        f = np.asarray(est.f)
+        # CaImAn convention: b is (n_pixels, n_bg), f is (n_bg, n_frames)
+        if b.ndim == 1:
+            b = b.reshape(-1, 1)
+        if f.ndim == 1:
+            f = f.reshape(1, -1)
+        if b.shape[1] != f.shape[0]:
+            # Tolerate transposed b that some sources save
+            if b.shape[0] == f.shape[0]:
+                b = b.T
+            else:
+                return None
+        mean_f = f.mean(axis=1)            # (n_bg,)
+        flat   = b @ mean_f                # (n_pixels,)
+        return np.asarray(flat).ravel().reshape(est.dims, order="F")
+
     def _build_bg_image(self, mask: np.ndarray) -> np.ndarray:
         est      = self.session.est
         dims     = est.dims
         bkg_mode = self.bkg_combo.currentText()
         if not mask.any():
-            return np.zeros(dims)
+            base = np.zeros(dims)
+            if bkg_mode == "W comp + bkg" and self._bkg_bg_img is not None:
+                base = base + self._bkg_bg_img
+            return base
+
         A_sub = est.A[:, mask]
         if bkg_mode == "Components":
             img = np.asarray(A_sub.sum(axis=1)).ravel().reshape(dims, order="F")
         else:
-            col_max = np.asarray(A_sub.max(axis=0).toarray()).ravel()
-            col_max[col_max == 0] = 1.0
-            weights = 1.0 / col_max
+            weights = np.asarray(self._bkg_comp_weights)[mask]
             img = np.asarray(A_sub @ weights).ravel().reshape(dims, order="F")
-            if bkg_mode == "W comp + bkg" and est.b is not None:
-                b = np.asarray(est.b)
-                b_img = (b.sum(axis=1) if b.ndim == 2 else b).ravel().reshape(dims, order="F")
-                img = img + b_img * 0.2
+            if bkg_mode == "W comp + bkg" and self._bkg_bg_img is not None:
+                # Literal MATLAB formula: weighted comp + spatial-background image.
+                # `img` may be mixed-sign here (Python CaImAn ships baseline-
+                # subtracted C); that's intentional — the bkg dominates and the
+                # signed contribution modulates on top of it.
+                img = img + self._bkg_bg_img
+            elif bkg_mode == "Weighted comp":
+                # Display magnitude so all active cells appear as bright spots on
+                # a dark background instead of the (technically MATLAB-correct
+                # but visually inverted) mid-grey background with cells dipping
+                # below it.
+                img = np.abs(img)
         return img
 
     def _draw_backgrounds(self) -> None:
@@ -268,16 +334,32 @@ class ImagePanel(QWidget):
             interpolation="nearest", **self._clim(rej_img),
         )
 
-    @staticmethod
-    def _clim(img: np.ndarray, pct_lo: float = 0.5, pct_hi: float = 99.5) -> dict:
-        """Return vmin/vmax based on percentiles of non-zero pixels."""
-        nonzero = img[img > 0]
-        if len(nonzero) == 0:
-            return {"vmin": 0, "vmax": 1e-9}
-        return {
-            "vmin": float(np.percentile(nonzero, pct_lo)),
-            "vmax": float(np.percentile(nonzero, pct_hi)),
-        }
+    def _clim(self, img: np.ndarray) -> dict:
+        """Color range for the composite background.
+
+        - "Components" / "Weighted comp": non-negative, mostly-zero images.
+          Anchor at 0 (empty FOV reads as dark) and cap at 99.5-pct of non-zero
+          pixels so a single hot footprint pixel doesn't compress the range.
+        - "W comp + bkg": dominated by the `b @ mean(f)` background. A 1-pct
+          vmin trims the lower tail so the bkg pixels are mid-colormap rather
+          than all crushed to dark, then 99.5-pct vmax leaves room for cells
+          to pop on top.
+        """
+        if img.size == 0:
+            return {"vmin": 0.0, "vmax": 1e-9}
+        bkg_mode = self.bkg_combo.currentText()
+        if bkg_mode == "W comp + bkg":
+            lo = float(np.percentile(img, 1.0))
+            hi = float(np.percentile(img, 99.5))
+        else:
+            nz = img[img > 0]
+            if nz.size == 0:
+                return {"vmin": 0.0, "vmax": 1e-9}
+            lo = 0.0
+            hi = float(np.percentile(nz, 99.5))
+        if hi <= lo:
+            hi = lo + 1e-9
+        return {"vmin": lo, "vmax": hi}
 
     def _update_colorbar(self, vals, color_range) -> None:
         """Refresh the colorbar next to the metric dropdown."""

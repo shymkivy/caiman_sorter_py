@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import (
     QFileDialog, QMessageBox,
 )
 
+from caiman_sorter_py import __version__
 from caiman_sorter_py.core.state import Session
 from caiman_sorter_py.ui.image_panel import ImagePanel
 from caiman_sorter_py.ui.merge_panel import MergePanel
@@ -144,11 +145,14 @@ class _FoopsiDialog(QDialog):
 
 
 class _LoadingDialog(QDialog):
-    """Non-closable modal dialog shown while data loads."""
+    """Non-closable modal dialog shown while data loads or saves."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None,
+                 title: str = "Loading Data",
+                 heading: str = "Loading Data…",
+                 initial_status: str = "Initializing…"):
         super().__init__(parent)
-        self.setWindowTitle("Loading Data")
+        self.setWindowTitle(title)
         self.setModal(True)
         self.setWindowFlags(
             Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint
@@ -159,14 +163,14 @@ class _LoadingDialog(QDialog):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(10)
 
-        title = QLabel("Loading Data…")
-        font  = title.font()
+        title_lbl = QLabel(heading)
+        font  = title_lbl.font()
         font.setPointSize(11)
         font.setBold(True)
-        title.setFont(font)
-        layout.addWidget(title)
+        title_lbl.setFont(font)
+        layout.addWidget(title_lbl)
 
-        self._status = QLabel("Initializing…")
+        self._status = QLabel(initial_status)
         self._status.setWordWrap(True)
         self._status.setMinimumHeight(40)
         layout.addWidget(self._status)
@@ -175,7 +179,46 @@ class _LoadingDialog(QDialog):
         self._status.setText(text)
 
     def closeEvent(self, event) -> None:
-        event.ignore()   # prevent user from closing while loading
+        event.ignore()   # prevent user from closing while busy
+
+
+class _SaveWorker(QThread):
+    """Runs session save (and optional .mat export) off the main thread."""
+    progress  = pyqtSignal(str)
+    succeeded = pyqtSignal(str, str)   # h5 path, mat path ('' if none)
+    failed    = pyqtSignal(str, str, str)  # message, traceback, which ('h5'|'mat')
+
+    def __init__(self, est, proc, ops, h5_path: str,
+                 mat_path: str, source_path: str):
+        super().__init__()
+        self.est, self.proc, self.ops = est, proc, ops
+        self.h5_path = h5_path
+        self.mat_path = mat_path
+        self.source_path = source_path
+
+    def run(self) -> None:
+        try:
+            from caiman_sorter_py.io.session import save_session
+            self.progress.emit(f"Writing session HDF5 ({Path(self.h5_path).name})…")
+            save_session(self.h5_path, self.est, self.proc, self.ops,
+                         source_path=self.source_path)
+        except Exception as exc:
+            import traceback
+            self.failed.emit(str(exc), traceback.format_exc(), "h5")
+            return
+
+        if self.mat_path:
+            try:
+                from caiman_sorter_py.io.mat_export import save_session_mat
+                self.progress.emit(f"Writing MATLAB v7.3 ({Path(self.mat_path).name})…")
+                save_session_mat(self.mat_path, self.est, self.proc, self.ops,
+                                 source_path=self.source_path)
+            except Exception as exc:
+                import traceback
+                self.failed.emit(str(exc), traceback.format_exc(), "mat")
+                return
+
+        self.succeeded.emit(self.h5_path, self.mat_path)
 
 
 class MainWindow(QMainWindow):
@@ -185,12 +228,12 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self._settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
         self.session = Session()
-        self.setWindowTitle("CaImAn Sorter")
+        self.setWindowTitle(f"CaImAn Sorter v{__version__}")
         self.resize(1600, 950)
         self._build_ui()
         self._connect_signals()
         self._restore_settings()
-        self.log("CaImAn Sorter started.")
+        self.log(f"CaImAn Sorter v{__version__} started.")
 
     # ------------------------------------------------------------------
     # UI construction
@@ -215,9 +258,9 @@ class MainWindow(QMainWindow):
         self.browse_btn.setToolTip(
             "Pick a file to open. Accepts:\n"
             "  • CaImAn HDF5 output (*.hdf5, *.h5)\n"
-            "  • Saved sort session (*.csort.h5)\n"
+            "  • Saved sort session (*.h5)\n"
             "  • Saved sort session (*.mat — MATLAB v7.3)\n"
-            "  • Saved ops only (*.csort_ops.h5) — applies params without touching data"
+            "  • Saved ops only (*_ops.h5) — applies params without touching data"
         )
         self.filepath_edit = QLineEdit()
         self.filepath_edit.setPlaceholderText("Select a CaImAn .hdf5 / session .h5 / sort .mat file…")
@@ -227,13 +270,13 @@ class MainWindow(QMainWindow):
         self.load_btn.setToolTip(
             "Load the selected file. Auto-detects format:\n"
             "  • CaImAn HDF5 → runs full proc init (~5–30 s)\n"
-            "  • Sort session (.csort.h5 / .mat) → restores est/proc/ops directly (fast)\n"
+            "  • Sort session (.h5 / .mat) → restores est/proc/ops directly (fast)\n"
             "  • Ops file → applies params only, no reload"
         )
         self.save_btn = QPushButton("Save")
         self.save_btn.setEnabled(False)
         self.save_btn.setToolTip(
-            "Save the full sort session as .csort.h5 (self-contained).\n"
+            "Save the full sort session as .h5 (self-contained).\n"
             "If 'Also save MATLAB .mat' is on in the Params tab, a .mat sidecar\n"
             "is written too, matching the legacy MATLAB pipeline format."
         )
@@ -241,7 +284,7 @@ class MainWindow(QMainWindow):
         self.save_ops_btn.setEnabled(False)
         self.save_ops_btn.setToolTip(
             "Save only the current params (evaluation thresholds, deconv settings,\n"
-            "smoothing, save tag, etc.) as a small .csort_ops.h5 file.\n"
+            "smoothing, save tag, etc.) as a small _ops.h5 file.\n"
             "Useful for sharing parameters between sessions or recordings."
         )
 
@@ -320,7 +363,7 @@ class MainWindow(QMainWindow):
         self.save_tag_edit.setToolTip(
             "String appended to the source stem when generating default save filenames.\n"
             "E.g. with tag '_sort' and source 'M1_results_cnmf.hdf5' the default save names are:\n"
-            "  M1_results_cnmf_sort.csort.h5  and  M1_results_cnmf_sort.mat"
+            "  M1_results_cnmf_sort.h5  and  M1_results_cnmf_sort.mat"
         )
         self.save_tag_edit.textChanged.connect(
             lambda txt: setattr(self.session.ops, "save_tag", txt)
@@ -412,10 +455,10 @@ class MainWindow(QMainWindow):
         start_dir = self._settings.value("last_browse_dir", "")
         path, _ = QFileDialog.getOpenFileName(
             self, "Open CaImAn or session file", start_dir,
-            "CaImAn / session / sort .mat (*.hdf5 *.h5 *.csort.h5 *.mat);;"
-            "Session only (*.csort.h5);;"
+            "CaImAn / session / sort .mat (*.hdf5 *.h5 *.mat);;"
+            "Session HDF5 (*.h5);;"
             "Sort .mat (*.mat);;"
-            "Ops only (*.csort_ops.h5);;"
+            "Ops file (*_ops.h5);;"
             "All files (*)"
         )
         if path:
@@ -528,7 +571,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "foopsi error", msg)
 
     def _on_save(self) -> None:
-        """Save full session to a .csort.h5 file (self-contained)."""
+        """Save full session to an .h5 file (self-contained)."""
         if self.session.est is None or self.session.proc is None:
             QMessageBox.warning(self, "No data", "Load a file before saving.")
             return
@@ -537,72 +580,88 @@ class MainWindow(QMainWindow):
 
         source = self._load_worker.path if hasattr(self, "_load_worker") else ""
         tag = self.session.ops.save_tag or ""
-        default = self._default_save_path(source, suffix=f"{tag}.csort.h5")
+        default = self._default_save_path(source, suffix=f"{tag}.h5")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save session", default,
-            "Sort session (*.csort.h5);;HDF5 (*.h5);;All files (*)"
+            "Sort session HDF5 (*.h5);;All files (*)"
         )
         if not path:
             return
         if not path.lower().endswith((".h5", ".hdf5")):
-            path += ".csort.h5"
+            path += ".h5"
 
-        try:
-            from caiman_sorter_py.io.session import save_session
-            save_session(path, self.session.est, self.session.proc,
-                         self.session.ops, source_path=source)
-        except Exception as exc:
-            import traceback
-            self.log(f"Save error: {exc}")
-            self.log(traceback.format_exc())
-            QMessageBox.critical(self, "Save error", str(exc))
-            return
-        self.log(f"Session saved: {path}")
+        mat_path = self._mat_sidecar_path(path) if self.session.ops.save_as_mat else ""
 
-        # Optional .mat sidecar for legacy MATLAB code
-        if self.session.ops.save_as_mat:
-            mat_path = self._mat_sidecar_path(path)
-            self.log(f"Writing MATLAB v7.3 .mat: {mat_path} …")
-            try:
-                from caiman_sorter_py.io.mat_export import save_session_mat
-                save_session_mat(mat_path, self.session.est, self.session.proc,
-                                 self.session.ops, source_path=source)
-            except Exception as exc:
-                import traceback
-                self.log(f".mat save error: {exc}")
-                self.log(traceback.format_exc())
-                QMessageBox.warning(self, ".mat save error",
-                                    f"Wrote {path}, but .mat export failed:\n\n{exc}")
-                return
+        self.log(f"Saving: {path} …")
+        if mat_path:
+            self.log(f"  + MATLAB .mat sidecar: {mat_path}")
+        self.save_btn.setEnabled(False)
+        self.save_ops_btn.setEnabled(False)
+
+        self._saving_dlg = _LoadingDialog(
+            self,
+            title="Saving Data",
+            heading="Saving Data…",
+            initial_status="Preparing…",
+        )
+        self._save_worker = _SaveWorker(
+            self.session.est, self.session.proc, self.session.ops,
+            path, mat_path, source,
+        )
+        self._save_worker.progress.connect(self._on_save_progress)
+        self._save_worker.succeeded.connect(self._on_save_succeeded)
+        self._save_worker.failed.connect(self._on_save_failed)
+        self._save_worker.start()
+        self._saving_dlg.exec_()
+
+    def _on_save_progress(self, msg: str) -> None:
+        self.log(msg)
+        if hasattr(self, "_saving_dlg"):
+            self._saving_dlg.set_status(msg)
+
+    def _on_save_succeeded(self, h5_path: str, mat_path: str) -> None:
+        self._saving_dlg.done(0)
+        self.log(f"Session saved: {h5_path}")
+        if mat_path:
             self.log(f"MATLAB .mat saved: {mat_path}")
+        self.save_btn.setEnabled(True)
+        self.save_ops_btn.setEnabled(True)
+
+    def _on_save_failed(self, msg: str, tb: str, which: str) -> None:
+        self._saving_dlg.done(0)
+        self.log(f"Save error ({which}): {msg}")
+        self.log(tb)
+        self.save_btn.setEnabled(True)
+        self.save_ops_btn.setEnabled(True)
+        if which == "mat":
+            QMessageBox.warning(self, ".mat save error",
+                                f"Session HDF5 was written, but .mat export failed:\n\n{msg}")
+        else:
+            QMessageBox.critical(self, "Save error", msg)
 
     def _mat_sidecar_path(self, h5_path: str) -> str:
         """Derive the .mat sidecar path from the chosen .h5 save path.
 
-        Strips a trailing '.csort' from the h5 stem so the .mat just becomes
-        <stem>.mat — whatever tag the user already baked into the .h5 filename
-        will already be present in <stem>.
+        Just swaps the extension to .mat — whatever tag the user baked into
+        the .h5 filename is preserved in the stem.
         """
         p = Path(h5_path)
-        stem = p.stem
-        if stem.endswith(".csort"):
-            stem = stem[: -len(".csort")]
-        return str(p.parent / (stem + ".mat"))
+        return str(p.with_suffix(".mat"))
 
     def _on_save_ops(self) -> None:
-        """Save the ops/parameters to a small .csort_ops.h5 file."""
+        """Save the ops/parameters to a small _ops.h5 file."""
         self.params_panel.sync_to_ops()
         source = self._load_worker.path if hasattr(self, "_load_worker") else ""
         tag = self.session.ops.save_tag or ""
-        default = self._default_save_path(source, suffix=f"{tag}.csort_ops.h5")
+        default = self._default_save_path(source, suffix=f"{tag}_ops.h5")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Ops", default,
-            "Ops file (*.csort_ops.h5);;HDF5 (*.h5);;All files (*)"
+            "Ops file (*_ops.h5);;HDF5 (*.h5);;All files (*)"
         )
         if not path:
             return
         if not path.lower().endswith((".h5", ".hdf5")):
-            path += ".csort_ops.h5"
+            path += "_ops.h5"
         try:
             from caiman_sorter_py.io.session import save_ops
             save_ops(path, self.session.ops)

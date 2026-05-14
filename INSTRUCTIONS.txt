@@ -1,74 +1,136 @@
 ====================================================
- CaImAn Sorter (Python) — Installation & Usage
+ CaImAn Sorter (Python) v1.00 — Installation & Usage
 ====================================================
+
+A PyQt5 GUI for sorting/curating CaImAn CNMF outputs. Python port of
+the MATLAB caiman_sorter pipeline (../caiman_sorter/).
+
 
 REQUIREMENTS
 ------------
 - Python 3.9 or later (Anaconda/Miniconda recommended)
-- CaImAn Python library (optional — needed for deconvolution and contours)
+- CaImAn Python (required for the foopsi/OASIS deconvolution and for
+  computing spatial contours on load)
 
 
 INSTALLATION
 ------------
-1. Activate your conda environment (e.g. the one where CaImAn is installed):
+1. Activate the conda environment that has CaImAn installed:
 
      conda activate caiman
 
-2. Install the required Python packages:
+2. Install the additional Python packages this GUI needs:
 
-     pip install PyQt5 matplotlib numpy scipy h5py scikit-image
+     pip install PyQt5 matplotlib numpy scipy h5py scikit-image \
+                 scikit-learn hdf5storage joblib
 
-   If you are NOT using a CaImAn environment, that is fine — the viewer
-   will open files and display data. Deconvolution and contour generation
-   require CaImAn and will show "not implemented" until Steps 4 and 8
-   of development are complete.
+   (scikit-learn is only used by the NMF merge method;
+    hdf5storage is only used for MATLAB v7.3 .mat export/import.)
 
 
 RUNNING THE GUI
 ---------------
-The caiman_sorter_py folder lives inside the caiman_sorter repo:
+The caiman_sorter_py folder lives inside the caiman_sorter repo. Run
+from the parent directory:
 
      cd C:\Users\ys2605\Desktop\stuff\caiman_sorter
      python -m caiman_sorter_py
 
-You must run from the caiman_sorter directory (one level above
-caiman_sorter_py), so Python can find the package.
+The window title shows the version (e.g. "CaImAn Sorter v1.00").
 
 
-CURRENT STATUS (development in progress)
------------------------------------------
-The GUI skeleton is complete — the window opens with all panels visible.
-Data loading, trace plotting, and accept/reject logic are not yet wired up.
-See the task list for the implementation roadmap:
-  Step 1  — Data Loading          (io/hdf5_loader.py, io/session.py)
-  Step 2  — Proc Initialization   (core/proc_init.py)
-  Step 3  — Main Window skeleton  [DONE]
-  Step 4  — Image Display + Contours (ui/image_panel.py, core/contours.py)
-  Step 5  — Cell Navigation + Info   (ui/nav_panel.py)
-  Step 6  — Calcium Trace Plot       (ui/trace_panel.py)
-  Step 7  — Accept/Reject + Eval     (core/evaluation.py)
-  Step 8  — Deconvolution            (core/deconvolution.py)
-  Step 9  — Save Session             (io/session.py)
+SUPPORTED FILE FORMATS
+----------------------
+The Load button auto-detects the file type by looking at HDF5 root
+attributes / group layout, not the extension:
+
+  CaImAn HDF5 output (*.hdf5, *.h5)
+      Raw CNMF results. Loads est + runs full proc init
+      (noise, peaks, AR coefficients, firing stability) — typically
+      5–30 s for a few hundred cells.
+
+  Sort session (*.h5)
+      A previously-saved full session. Restores est/proc/ops directly,
+      no proc init needed (fast).
+
+  Sort session (*.mat)
+      MATLAB v7.3 format — the same layout the legacy MATLAB pipeline
+      produces (f_cs_save_data.m), or what this app exports when
+      "Also save MATLAB .mat" is on.
+
+  Ops file (*_ops.h5)
+      Only the GUI parameters. Loading one applies the parameters in
+      place without touching est/proc — useful for sharing thresholds
+      and deconvolution settings between recordings.
+
+
+WORKFLOW
+--------
+1. Browse → pick a CaImAn HDF5 (or an existing sort session).
+2. Load → est/proc populate; the image panel shows accepted/rejected
+   composites with contours, and the trace panel shows the current cell.
+3. Inspect cells:
+   • Click a contour to jump to that cell.
+   • Right-click a contour to toggle accept/reject (manual override).
+   • Up/Down or the spinner in the Component box steps through cells.
+4. Tune evaluation thresholds in the Params tab (two modes:
+   CaImAn-style union/intersection or stepwise reject-threshold).
+5. Run deconvolution in the Deconvolution tab:
+   • Smooth dF/dt — Gaussian-smoothed temporal derivative
+     (fast, vectorised; live preview updates as you change params).
+   • Constrained foopsi (OASIS / CVXPY / CVX) — parallelised across
+     cells with joblib. Solver availability is checked at run time
+     and a friendly install hint is shown if the picked backend is
+     missing.
+6. Find duplicates in the Merge tab:
+   • Spatial overlap (A^T A) + temporal correlation thresholds.
+   • Per-pair "Plot pair" preview shows both cells and the merge
+     candidate side-by-side; the trace plot has Pan/Zoom toolbar.
+   • Apply either "choose best SNR" (reject the lower-SNR² cell) or
+     "create new cell" with one of four merge methods (weighted ave,
+     full mean corr, svd, nmf) — full proc metrics + foopsi are
+     recomputed for the new cell.
+7. Save:
+   • Save → writes the full session as <stem><save_tag>.h5
+   • If "Also save MATLAB .mat" is on, a sidecar <stem><save_tag>.mat
+     is written too, matching the MATLAB pipeline's format.
+   • Save Ops → writes <stem><save_tag>_ops.h5 with just the parameters.
 
 
 FILE STRUCTURE
 --------------
 caiman_sorter_py/
-  __main__.py          entry point (python -m caiman_sorter_py)
-  app.py               QApplication bootstrap
+  __init__.py            __version__ (single source of truth)
+  __main__.py            entry point (python -m caiman_sorter_py)
+  app.py                 QApplication bootstrap
+  CLAUDE.md              architecture notes for Claude Code
+  INSTRUCTIONS.txt       this file
   io/
-    hdf5_loader.py     load CaImAn .hdf5 output
-    mat_loader.py      load legacy MATLAB .mat sessions
-    session.py         save/load Python sessions (.h5)
+    hdf5_loader.py       load CaImAn .hdf5 output
+    session.py           save/load .h5 / _ops.h5 (self-contained)
+    mat_export.py        write MATLAB v7.3 .mat (legacy compat)
+    mat_loader.py        read MATLAB v7.3 .mat back into est/proc/ops
   core/
-    state.py           Estimates / Proc / Ops dataclasses + Session
-    proc_init.py       noise, AR coefficients, peaks, firing stability
-    evaluation.py      threshold-based accept/reject logic
-    deconvolution.py   smooth dF/dt, foopsi, MCMC wrappers
-    contours.py        contour computation + composite image builder
+    state.py             Estimates / Proc / Ops dataclasses + Session
+    proc_init.py         noise, AR coefficients, peaks, firing stab
+    evaluation.py        accept/reject logic (caiman / reject-threshold)
+    deconvolution.py     smooth dF/dt, OASIS/CVXPY/CVX foopsi
+    merge.py             duplicate detection + cell merging
+    contours.py          contour extraction from sparse A
   ui/
-    main_window.py     main window layout and toolbar
-    image_panel.py     accepted/rejected cell images + contours
-    trace_panel.py     calcium trace plot
-    nav_panel.py       cell navigation, metrics, component image
-    params_panel.py    evaluation and deconvolution parameter tabs
+    main_window.py       toolbar, dialogs (load/save/foopsi), menus
+    image_panel.py       accepted/rejected composite images + contours
+    trace_panel.py       calcium trace plot with deconv overlays
+    nav_panel.py         cell navigation, metrics, component image
+    params_panel.py      Evaluation + Deconvolution + Save parameters
+    merge_panel.py       duplicate-detection table + plot dialog
+
+
+SAVED FILE LAYOUT
+-----------------
+Both .h5 file types carry HDF5 root attributes:
+  format       — "caiman_sorter_session" or "caiman_sorter_ops"
+  app_version  — e.g. "1.00"
+  saved_at     — ISO timestamp
+
+Full sessions also store the source CaImAn path under source_path.
