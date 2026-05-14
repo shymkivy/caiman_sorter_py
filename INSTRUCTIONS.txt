@@ -1,0 +1,74 @@
+====================================================
+ CaImAn Sorter (Python) — Installation & Usage
+====================================================
+
+REQUIREMENTS
+------------
+- Python 3.9 or later (Anaconda/Miniconda recommended)
+- CaImAn Python library (optional — needed for deconvolution and contours)
+
+
+INSTALLATION
+------------
+1. Activate your conda environment (e.g. the one where CaImAn is installed):
+
+     conda activate caiman
+
+2. Install the required Python packages:
+
+     pip install PyQt5 matplotlib numpy scipy h5py scikit-image
+
+   If you are NOT using a CaImAn environment, that is fine — the viewer
+   will open files and display data. Deconvolution and contour generation
+   require CaImAn and will show "not implemented" until Steps 4 and 8
+   of development are complete.
+
+
+RUNNING THE GUI
+---------------
+The caiman_sorter_py folder lives inside the caiman_sorter repo:
+
+     cd C:\Users\ys2605\Desktop\stuff\caiman_sorter
+     python -m caiman_sorter_py
+
+You must run from the caiman_sorter directory (one level above
+caiman_sorter_py), so Python can find the package.
+
+
+CURRENT STATUS (development in progress)
+-----------------------------------------
+The GUI skeleton is complete — the window opens with all panels visible.
+Data loading, trace plotting, and accept/reject logic are not yet wired up.
+See the task list for the implementation roadmap:
+  Step 1  — Data Loading          (io/hdf5_loader.py, io/session.py)
+  Step 2  — Proc Initialization   (core/proc_init.py)
+  Step 3  — Main Window skeleton  [DONE]
+  Step 4  — Image Display + Contours (ui/image_panel.py, core/contours.py)
+  Step 5  — Cell Navigation + Info   (ui/nav_panel.py)
+  Step 6  — Calcium Trace Plot       (ui/trace_panel.py)
+  Step 7  — Accept/Reject + Eval     (core/evaluation.py)
+  Step 8  — Deconvolution            (core/deconvolution.py)
+  Step 9  — Save Session             (io/session.py)
+
+
+FILE STRUCTURE
+--------------
+caiman_sorter_py/
+  __main__.py          entry point (python -m caiman_sorter_py)
+  app.py               QApplication bootstrap
+  io/
+    hdf5_loader.py     load CaImAn .hdf5 output
+    mat_loader.py      load legacy MATLAB .mat sessions
+    session.py         save/load Python sessions (.h5)
+  core/
+    state.py           Estimates / Proc / Ops dataclasses + Session
+    proc_init.py       noise, AR coefficients, peaks, firing stability
+    evaluation.py      threshold-based accept/reject logic
+    deconvolution.py   smooth dF/dt, foopsi, MCMC wrappers
+    contours.py        contour computation + composite image builder
+  ui/
+    main_window.py     main window layout and toolbar
+    image_panel.py     accepted/rejected cell images + contours
+    trace_panel.py     calcium trace plot
+    nav_panel.py       cell navigation, metrics, component image
+    params_panel.py    evaluation and deconvolution parameter tabs
