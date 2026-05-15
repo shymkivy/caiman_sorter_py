@@ -115,6 +115,12 @@ def apply_choose_best_snr(proc, pairs: list[DuplicatePair]) -> dict:
         if proc.accepted[loser]:
             proc.accepted[loser] = False
             proc.manual_override[loser] = True
+            # Also update accepted_core so the loser stays rejected even if
+            # the user later clears manual overrides and re-evaluates: without
+            # this, the stale accepted_core[loser]=True would bounce back into
+            # accepted[loser] via evaluation.update_accepted.
+            if proc.accepted_core is not None:
+                proc.accepted_core[loser] = False
             n_changed += 1
     return {"n_changed": n_changed, "kept": kept_list, "rejected": rej_list}
 

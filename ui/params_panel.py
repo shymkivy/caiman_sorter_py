@@ -139,14 +139,25 @@ class ParamsPanel(QWidget):
             self._rej_spins[key] = spin
         v.addWidget(self.reject_group)
 
-        # Evaluate button
+        # Evaluate + reset-manual buttons
+        btn_row = QHBoxLayout()
         self.evaluate_btn = QPushButton("Evaluate All")
         self.evaluate_btn.setEnabled(False)
         self.evaluate_btn.setToolTip(
             "Re-run automatic evaluation with the current settings.\n"
             "Cells that were manually accepted/rejected are preserved."
         )
-        v.addWidget(self.evaluate_btn)
+        btn_row.addWidget(self.evaluate_btn)
+
+        self.reset_manual_btn = QPushButton("Reset manual edits")
+        self.reset_manual_btn.setEnabled(False)
+        self.reset_manual_btn.setToolTip(
+            "Clear every manual accept/reject and revert all cells to their\n"
+            "last automatic-evaluation state (proc.accepted_core).\n"
+            "Asks for confirmation — this can't be undone."
+        )
+        btn_row.addWidget(self.reset_manual_btn)
+        v.addLayout(btn_row)
         v.addStretch()
 
         self.eval_method_combo.currentIndexChanged.connect(self._on_method_changed)
@@ -332,10 +343,12 @@ class ParamsPanel(QWidget):
     def _connect_session(self) -> None:
         self.session.add_listener("data_loaded", self._on_data_loaded)
         self.evaluate_btn.clicked.connect(self._on_evaluate)
+        self.reset_manual_btn.clicked.connect(self._on_reset_manual)
         self.run_foopsi_btn.clicked.connect(self._on_run_foopsi)
 
     def _on_data_loaded(self) -> None:
         self.evaluate_btn.setEnabled(True)
+        self.reset_manual_btn.setEnabled(True)
         self.run_foopsi_btn.setEnabled(True)
         # Seed CaImAn thresholds from the values stored in the file
         ep = self.session.est.eval_params_caiman or {}
@@ -483,6 +496,45 @@ class ParamsPanel(QWidget):
         ops = self.session.ops
         core_mask = evaluate_components(self.session.est, self.session.proc, ops)
         update_accepted(self.session.proc, core_mask)
+        self.session.reevaluate_all()
+
+    def _on_reset_manual(self) -> None:
+        """Clear every manual override and revert to the last auto-eval state.
+
+        Asks for confirmation since this discards user work that can't be recovered.
+        After confirming, sets `manual_override` to all-False and copies
+        `accepted_core` into `accepted` (or runs a fresh evaluation if no
+        `accepted_core` has been computed yet), then emits cells_reevaluated.
+        """
+        from PyQt5.QtWidgets import QMessageBox
+        proc = self.session.proc
+        if proc is None or proc.manual_override is None:
+            return
+        n_manual = int(proc.manual_override.sum())
+        if n_manual == 0:
+            QMessageBox.information(self, "Reset manual edits",
+                                    "There are no manual accept/reject edits to reset.")
+            return
+        reply = QMessageBox.question(
+            self, "Reset manual edits",
+            f"Reset {n_manual} manually-edited cell{'s' if n_manual != 1 else ''} "
+            "back to the last automatic-evaluation state?\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        import numpy as np
+        proc.manual_override[:] = False
+        if proc.accepted_core is not None:
+            proc.accepted = np.asarray(proc.accepted_core, dtype=bool).copy()
+        else:
+            # No prior auto-eval — run one with current params
+            from caiman_sorter_py.core.evaluation import evaluate_components, update_accepted
+            self.sync_to_ops()
+            core_mask = evaluate_components(self.session.est, proc, self.session.ops)
+            update_accepted(proc, core_mask)
         self.session.reevaluate_all()
 
     def _cells_to_process(self) -> "np.ndarray":

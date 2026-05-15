@@ -32,19 +32,30 @@ def get_init_param(init: Optional[dict], key: str, default=None):
     Newer loads store the full nested CaImAn params struct (data/init/temporal/...);
     legacy session files may have flat keys at the top level. Try the flat top
     level first, then fall back to the nested path.
+
+    Scalar params that round-tripped through HDF5 / .mat may come back as a
+    1-element numpy array or list — unwrap those before returning so callers
+    can `float(...)`/`int(...)` the result directly.
     """
     if not init:
         return default
+    cur = None
     if key in init and not isinstance(init[key], dict):
-        return init[key]
-    path = _INIT_PARAM_PATHS.get(key)
-    if path is None:
-        return default
-    cur = init
-    for p in path:
-        if not isinstance(cur, dict) or p not in cur:
+        cur = init[key]
+    else:
+        path = _INIT_PARAM_PATHS.get(key)
+        if path is None:
             return default
-        cur = cur[p]
+        cur = init
+        for p in path:
+            if not isinstance(cur, dict) or p not in cur:
+                return default
+            cur = cur[p]
+    # Unwrap 1-element array/list so int(...)/float(...) on the result works.
+    if isinstance(cur, np.ndarray) and cur.size == 1:
+        return cur.ravel()[0].item() if cur.dtype != object else cur.ravel()[0]
+    if isinstance(cur, (list, tuple)) and len(cur) == 1:
+        return cur[0]
     return cur
 
 
