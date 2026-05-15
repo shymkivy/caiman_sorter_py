@@ -495,8 +495,10 @@ class ParamsPanel(QWidget):
     def _on_run_foopsi(self) -> None:
         """Run constrained foopsi for current cell or all cells.
 
-        Single-cell: synchronous. All cells: defer to MainWindow worker.
-        Warns the user if the selected solver's dependencies are missing.
+        Always routed through MainWindow.run_foopsi_async so the user gets the
+        modal "Running Constrained foopsi" dialog regardless of cell count —
+        even a single cell can take ~0.5–1 s and a silent UI freeze feels
+        broken. Warns the user if the selected solver isn't installed.
         """
         from caiman_sorter_py.core.deconvolution import (
             run_foopsi, solver_available, SOLVER_INSTALL_HINT,
@@ -514,26 +516,19 @@ class ParamsPanel(QWidget):
             return
         cells = self._cells_to_process()
 
-        if len(cells) == 1:
-            try:
-                run_foopsi(self.session.est, self.session.proc, self.session.ops,
-                           cells=cells, parallel=False)
-            except Exception as exc:
-                import traceback
-                from PyQt5.QtWidgets import QMessageBox
-                QMessageBox.critical(self, "foopsi error",
-                                     f"{exc}\n\n{traceback.format_exc()}")
-                return
-            self.session.refresh_cell()
-            return
-
-        # All cells — main window owns the worker so it can show a modal dialog
         main = self.window()
         if hasattr(main, "run_foopsi_async"):
             main.run_foopsi_async(cells)
         else:
-            run_foopsi(self.session.est, self.session.proc, self.session.ops,
-                       cells=cells)
+            # Headless / detached fallback — no parent window to host the dialog
+            try:
+                run_foopsi(self.session.est, self.session.proc, self.session.ops,
+                           cells=cells)
+            except Exception as exc:
+                import traceback
+                QMessageBox.critical(self, "foopsi error",
+                                     f"{exc}\n\n{traceback.format_exc()}")
+                return
             self.session.refresh_cell()
 
     def _on_deconv_display_change(self) -> None:

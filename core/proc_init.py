@@ -145,15 +145,22 @@ def compute_noise(traces: np.ndarray) -> np.ndarray:
     """Estimate per-cell noise std via Welch PSD in the [0.25, 0.5] × Nyquist band.
 
     Mirrors MATLAB: GetSn.m, method='logmexp'
-    sn = sqrt(exp(mean(log(PSD[0.25–0.5] / 2))))
+        sn = sqrt(exp(mean(log(PSD[0.25–0.5] / 2))))
+
+    Matches MATLAB pwelch defaults so the noise estimates are directly
+    comparable to the GetSn.m output baked into est.neurons_sn:
+      - nperseg = floor(N / 4.5)  (MATLAB's default segment length)
+      - window  = hamming         (MATLAB's default)
+      - noverlap = nperseg // 2   (50% — scipy's default, also MATLAB's)
     """
     from scipy.signal import welch
 
     n_cells, n_frames = traces.shape
-    nperseg = min(256, n_frames)
+    nperseg = max(8, int(n_frames // 4.5))
 
     # Vectorised: single Welch call across all cells (axis=1)
-    freqs, psd = welch(traces, fs=1.0, nperseg=nperseg, axis=1)
+    freqs, psd = welch(traces, fs=1.0, window="hamming",
+                       nperseg=nperseg, axis=1)
     idx      = (freqs >= 0.25) & (freqs <= 0.5)
     psd_band = np.maximum(psd[:, idx] / 2.0, 1e-15)
     return np.sqrt(np.exp(np.mean(np.log(psd_band), axis=1)))
@@ -185,11 +192,16 @@ def estimate_ar_coefficients(p: int, sn: float, acf: np.ndarray,
     A = toeplitz(col, row) - sn ** 2 * np.eye(total_lags, p)
     g, _, _, _ = np.linalg.lstsq(A, rhs, rcond=None)
 
-    # Stabilise roots
+    # Stabilise roots. Mirrors MATLAB estimate_time_constant.m: when AR(2) yields
+    # complex-conjugate roots, perturb the real parts by ~N(0, 0.001) so they
+    # don't collapse to a double-pole after the np.real() projection — otherwise
+    # tauAR2 reports two identical time constants instead of two distinct ones.
     poly_coeffs = np.concatenate([[1.0], -g])
-    rg = np.roots(poly_coeffs).astype(complex)
-    rg = np.real(rg) + (0.0 if np.isreal(rg).all() else 0.001 * np.random.randn(len(rg)))
-    rg = np.real(rg)
+    rg = np.roots(poly_coeffs)
+    if not np.isreal(rg).all():
+        rg = np.real(rg) + 0.001 * np.random.randn(len(rg))
+    else:
+        rg = np.real(rg)
     rg[rg > 1.0] = 0.95 + 0.001 * np.random.randn(int(np.sum(rg > 1.0)))
     rg[rg < 0.0] = 0.15 + 0.001 * np.random.randn(int(np.sum(rg < 0.0)))
 

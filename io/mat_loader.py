@@ -73,8 +73,11 @@ def _read_est(g: h5py.Group) -> Estimates:
     cnn_preds = _read_1d(g, "cnn_preds", dtype=np.float32)
     r_values  = _read_1d(g, "r_values")
     sn        = _read_1d(g, "sn")
-    bb        = _read_1d(g, "b")
-    bg_f      = _read_1d(g, "f")
+    # b and f are CaImAn background components — keep their 2-D shapes:
+    #   b: (n_pixels, n_bg),  f: (n_bg, n_frames)
+    # so the image panel can reconstruct b @ mean(f, axis=1) without reshaping.
+    bb        = _read_2d(g, "b")
+    bg_f      = _read_2d(g, "f")
     neurons_sn = _read_1d(g, "neurons_sn")
 
     # AR coeffs: stored as (n_cells, p) in MATLAB, our internal is (p, n_cells)

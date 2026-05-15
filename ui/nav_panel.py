@@ -149,7 +149,14 @@ class NavPanel(QWidget):
         self.metrics_box = box
 
     def _build_component_image(self) -> None:
-        """Build the component image widget and store as self.component_box."""
+        """Build the component image widget and store as self.component_box.
+
+        A single persistent AxesImage (`self._comp_im`) is created here and
+        reused for every cell select via `set_data`/`set_clim`/`set_extent`.
+        That avoids the `cla()`+`imshow()` per cell-step pattern, which
+        churned matplotlib artist objects and lagged when arrow-stepping
+        through many cells.
+        """
         box = _SquareGroupBox("Component")
         box.setToolTip(
             "Spatial footprint of the currently selected cell, cropped to a square\n"
@@ -162,6 +169,12 @@ class NavPanel(QWidget):
         self.comp_ax = self.comp_fig.add_axes([0, 0, 1, 1])
         self.comp_ax.set_facecolor("#1e1e1e")
         self.comp_ax.axis("off")
+        # Persistent AxesImage; data swapped in via set_data on each cell change
+        self._comp_im = self.comp_ax.imshow(
+            np.zeros((1, 1)),
+            cmap="viridis", aspect="equal", origin="lower",
+            interpolation="nearest",
+        )
         self.comp_canvas = FigureCanvasQTAgg(self.comp_fig)
         self.comp_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         v.addWidget(self.comp_canvas)
@@ -283,11 +296,14 @@ class NavPanel(QWidget):
         vmin = float(np.percentile(nz, 0.5))  if len(nz) else 0
         vmax = float(np.percentile(nz, 99.5)) if len(nz) else 1e-9
 
-        self.comp_ax.cla()
-        self.comp_ax.set_position([0, 0, 1, 1])
-        self.comp_ax.imshow(crop, cmap="viridis", aspect="equal", origin="lower",
-                            interpolation="nearest", vmin=vmin, vmax=vmax)
-        self.comp_ax.axis("off")
+        # Update the persistent AxesImage instead of cla()+imshow each time.
+        # set_extent + matching axis limits handle differently-sized crops.
+        h, w = crop.shape
+        self._comp_im.set_data(crop)
+        self._comp_im.set_clim(vmin, vmax)
+        self._comp_im.set_extent((-0.5, w - 0.5, -0.5, h - 0.5))
+        self.comp_ax.set_xlim(-0.5, w - 0.5)
+        self.comp_ax.set_ylim(-0.5, h - 0.5)
         self.comp_canvas.draw_idle()
 
         # Show the current cell number in the group-box title

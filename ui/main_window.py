@@ -29,6 +29,11 @@ class _LoadWorker(QThread):
 
     Handles both a fresh CaImAn HDF5 (runs initialize_proc) and a saved
     session file (restores est/proc/ops directly, no proc init needed).
+
+    Produces brand-new `est` and `proc` objects — nothing in the live Session
+    is mutated until `MainWindow._on_load_succeeded` calls `session.load_data`.
+    `self.ops` is read-only here (used to gate behaviour like load_caiman_rejected),
+    so concurrent reads/writes are safe.
     """
     progress  = pyqtSignal(str)
     succeeded = pyqtSignal(object, object, object)   # est, proc, ops_or_None
@@ -84,7 +89,19 @@ class _LoadWorker(QThread):
 
 
 class _FoopsiWorker(QThread):
-    """Runs constrained foopsi for many cells off the main thread."""
+    """Runs constrained foopsi for many cells off the main thread.
+
+    Writes per-cell results into `proc.foopsi.{S,C,g}[idx]` in place. This is
+    safe **only because** the worker is always launched alongside a
+    `Qt.ApplicationModal` `_FoopsiDialog` (`setModal(True) + exec_()`), which
+    blocks all input to the rest of the application — so the main thread can't
+    mutate or read `proc.foopsi` while this worker runs. CPython's GIL also
+    guarantees that individual list-element writes are atomic.
+
+    If you ever launch this worker without a modal dialog, or switch the
+    dialog to non-modal, you MUST refactor to write into a private
+    `DeconvResults` and merge into `proc.foopsi` on the success signal.
+    """
     progress    = pyqtSignal(int, int)   # (done, total)
     log         = pyqtSignal(str)
     finished_ok = pyqtSignal(int)        # n_succeeded
@@ -114,7 +131,7 @@ class _FoopsiDialog(QDialog):
 
     def __init__(self, total: int, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Running Constrained foopsi")
+        self.setWindowTitle("Deconvolving")
         self.setModal(True)
         self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
         self.setMinimumWidth(440)
@@ -127,7 +144,8 @@ class _FoopsiDialog(QDialog):
         f = title.font(); f.setPointSize(11); f.setBold(True); title.setFont(f)
         layout.addWidget(title)
 
-        self._status = QLabel(f"Processing {total} cells…")
+        plural = "cell" if total == 1 else "cells"
+        self._status = QLabel(f"Deconvolving {total} {plural}…")
         self._status.setWordWrap(True)
         layout.addWidget(self._status)
 
@@ -138,7 +156,8 @@ class _FoopsiDialog(QDialog):
     def set_progress(self, done: int, total: int) -> None:
         self._bar.setRange(0, max(total, 1))
         self._bar.setValue(done)
-        self._status.setText(f"Processed {done} / {total} cells…")
+        plural = "cell" if total == 1 else "cells"
+        self._status.setText(f"Deconvolved {done} / {total} {plural}…")
 
     def closeEvent(self, event) -> None:
         event.ignore()
@@ -183,7 +202,12 @@ class _LoadingDialog(QDialog):
 
 
 class _SaveWorker(QThread):
-    """Runs session save (and optional .mat export) off the main thread."""
+    """Runs session save (and optional .mat export) off the main thread.
+
+    Only READS from `est/proc/ops` — never mutates them. Even if the main
+    thread changed those objects mid-save (which the modal `_LoadingDialog`
+    blocks), the worst case is an inconsistent on-disk snapshot, not corruption.
+    """
     progress  = pyqtSignal(str)
     succeeded = pyqtSignal(str, str)   # h5 path, mat path ('' if none)
     failed    = pyqtSignal(str, str, str)  # message, traceback, which ('h5'|'mat')
@@ -508,28 +532,40 @@ class MainWindow(QMainWindow):
         self._loading_dlg.set_status(msg)
 
     def _on_load_succeeded(self, est, proc, loaded_ops) -> None:
-        self._loading_dlg.done(0)
-        if loaded_ops is not None:
-            # Restoring a saved session — adopt the saved ops in place.
-            self.session.ops = loaded_ops
-            self.params_panel.load_ops()
-            if hasattr(self, "contour_thr_spin"):
-                self.contour_thr_spin.setValue(loaded_ops.contour_thr)
-            if hasattr(self, "load_rejected_chk"):
-                self.load_rejected_chk.setChecked(loaded_ops.load_caiman_rejected)
-        self.session.load_data(est, proc)
-        self._settings.setValue("last_file", self._load_worker.path)
-        n_acc = int(proc.accepted.sum())
-        self.log(f"Ready: {proc.num_cells} cells ({n_acc} accepted, "
-                 f"{proc.num_cells - n_acc} rejected), dims={est.dims}.")
-        self.load_btn.setEnabled(True)
+        # Close the dialog and re-enable controls FIRST so a downstream
+        # exception (e.g. inside a panel's data_loaded listener) can't leave
+        # the modal stuck on screen.
+        try:
+            if loaded_ops is not None:
+                # Restoring a saved session — adopt the saved ops in place.
+                self.session.ops = loaded_ops
+                self.params_panel.load_ops()
+                if hasattr(self, "contour_thr_spin"):
+                    self.contour_thr_spin.setValue(loaded_ops.contour_thr)
+                if hasattr(self, "load_rejected_chk"):
+                    self.load_rejected_chk.setChecked(loaded_ops.load_caiman_rejected)
+            self.session.load_data(est, proc)
+            self._settings.setValue("last_file", self._load_worker.path)
+            n_acc = int(proc.accepted.sum())
+            self.log(f"Ready: {proc.num_cells} cells ({n_acc} accepted, "
+                     f"{proc.num_cells - n_acc} rejected), dims={est.dims}.")
+        except Exception as exc:
+            import traceback
+            self.log(f"Post-load error: {exc}")
+            self.log(traceback.format_exc())
+            QMessageBox.critical(self, "Post-load error", str(exc))
+        finally:
+            self._loading_dlg.done(0)
+            self.load_btn.setEnabled(True)
 
     def _on_load_failed(self, msg: str, tb: str) -> None:
-        self._loading_dlg.done(0)
-        self.log(f"Load error: {msg}")
-        self.log(tb)
-        QMessageBox.critical(self, "Load error", msg)
-        self.load_btn.setEnabled(True)
+        try:
+            self.log(f"Load error: {msg}")
+            self.log(tb)
+            QMessageBox.critical(self, "Load error", msg)
+        finally:
+            self._loading_dlg.done(0)
+            self.load_btn.setEnabled(True)
 
     # ------------------------------------------------------------------
     # Deconvolution (foopsi) async runner
@@ -559,16 +595,24 @@ class MainWindow(QMainWindow):
         self._foopsi_dlg.exec_()
 
     def _on_foopsi_done(self, n_ok: int) -> None:
-        self._foopsi_dlg.done(0)
-        self.params_panel.run_foopsi_btn.setEnabled(True)
-        self.session.refresh_cell()
+        try:
+            self.session.refresh_cell()
+        except Exception as exc:
+            import traceback
+            self.log(f"Post-foopsi refresh error: {exc}")
+            self.log(traceback.format_exc())
+        finally:
+            self._foopsi_dlg.done(0)
+            self.params_panel.run_foopsi_btn.setEnabled(True)
 
     def _on_foopsi_failed(self, msg: str, tb: str) -> None:
-        self._foopsi_dlg.done(0)
-        self.log(f"foopsi error: {msg}")
-        self.log(tb)
-        self.params_panel.run_foopsi_btn.setEnabled(True)
-        QMessageBox.critical(self, "foopsi error", msg)
+        try:
+            self.log(f"foopsi error: {msg}")
+            self.log(tb)
+            QMessageBox.critical(self, "foopsi error", msg)
+        finally:
+            self._foopsi_dlg.done(0)
+            self.params_panel.run_foopsi_btn.setEnabled(True)
 
     def _on_save(self) -> None:
         """Save full session to an .h5 file (self-contained)."""
@@ -620,24 +664,28 @@ class MainWindow(QMainWindow):
             self._saving_dlg.set_status(msg)
 
     def _on_save_succeeded(self, h5_path: str, mat_path: str) -> None:
-        self._saving_dlg.done(0)
-        self.log(f"Session saved: {h5_path}")
-        if mat_path:
-            self.log(f"MATLAB .mat saved: {mat_path}")
-        self.save_btn.setEnabled(True)
-        self.save_ops_btn.setEnabled(True)
+        try:
+            self.log(f"Session saved: {h5_path}")
+            if mat_path:
+                self.log(f"MATLAB .mat saved: {mat_path}")
+        finally:
+            self._saving_dlg.done(0)
+            self.save_btn.setEnabled(True)
+            self.save_ops_btn.setEnabled(True)
 
     def _on_save_failed(self, msg: str, tb: str, which: str) -> None:
-        self._saving_dlg.done(0)
-        self.log(f"Save error ({which}): {msg}")
-        self.log(tb)
-        self.save_btn.setEnabled(True)
-        self.save_ops_btn.setEnabled(True)
-        if which == "mat":
-            QMessageBox.warning(self, ".mat save error",
-                                f"Session HDF5 was written, but .mat export failed:\n\n{msg}")
-        else:
-            QMessageBox.critical(self, "Save error", msg)
+        try:
+            self.log(f"Save error ({which}): {msg}")
+            self.log(tb)
+            if which == "mat":
+                QMessageBox.warning(self, ".mat save error",
+                                    f"Session HDF5 was written, but .mat export failed:\n\n{msg}")
+            else:
+                QMessageBox.critical(self, "Save error", msg)
+        finally:
+            self._saving_dlg.done(0)
+            self.save_btn.setEnabled(True)
+            self.save_ops_btn.setEnabled(True)
 
     def _mat_sidecar_path(self, h5_path: str) -> str:
         """Derive the .mat sidecar path from the chosen .h5 save path.
@@ -717,7 +765,35 @@ class MainWindow(QMainWindow):
         self.params_panel.load_ops()
 
     def closeEvent(self, event) -> None:
-        """Save window geometry, splitter sizes, and ops on close."""
+        """Save window geometry, splitter sizes, and ops on close.
+
+        Refuse to close while a worker QThread is still running — destroying the
+        thread mid-run would corrupt whatever it's doing (save half-written file,
+        deconv partially populated, etc.) and Qt would log
+        "QThread: Destroyed while thread is still running" before potentially
+        crashing.
+        """
+        running = self._running_workers()
+        if running:
+            from PyQt5.QtWidgets import QMessageBox
+            reply = QMessageBox.question(
+                self, "Background task running",
+                f"A background task is still running: {', '.join(running)}.\n\n"
+                "Wait for it to finish, or quit immediately and lose its work?",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Abort,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if reply == QMessageBox.StandardButton.Cancel:
+                event.ignore()
+                return
+            # User chose Abort — block briefly waiting for the workers, then quit
+            for w in (self._load_worker_or_none(),
+                      self._save_worker_or_none(),
+                      self._foopsi_worker_or_none()):
+                if w is not None and w.isRunning():
+                    w.quit()
+                    w.wait(3000)   # ms — give threads a moment to wind down
+
         self.params_panel.sync_to_ops()
         # Belt-and-braces: read MainWindow-owned widgets directly into ops so
         # an unfocused-but-edited field still gets persisted.
@@ -728,6 +804,29 @@ class MainWindow(QMainWindow):
         self._settings.setValue("window/splitter_left_v1",  self.left_splitter.saveState())
         self._settings.setValue("window/splitter_right_v2", self.right_splitter.saveState())
         super().closeEvent(event)
+
+    # ------------------------------------------------------------------
+    # Worker bookkeeping
+    # ------------------------------------------------------------------
+
+    def _load_worker_or_none(self) -> "QThread | None":
+        w = getattr(self, "_load_worker", None)
+        return w if (w is not None and w.isRunning()) else None
+
+    def _save_worker_or_none(self) -> "QThread | None":
+        w = getattr(self, "_save_worker", None)
+        return w if (w is not None and w.isRunning()) else None
+
+    def _foopsi_worker_or_none(self) -> "QThread | None":
+        w = getattr(self, "_foopsi_worker", None)
+        return w if (w is not None and w.isRunning()) else None
+
+    def _running_workers(self) -> list[str]:
+        out = []
+        if self._load_worker_or_none()   is not None: out.append("Load")
+        if self._save_worker_or_none()   is not None: out.append("Save")
+        if self._foopsi_worker_or_none() is not None: out.append("foopsi")
+        return out
 
     def _save_ops_settings(self) -> None:
         """Persist all Ops fields to QSettings.

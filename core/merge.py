@@ -254,6 +254,32 @@ def _compute_contour_for(A_flat: np.ndarray, dims: tuple[int, int],
     return contours[0] if contours else None
 
 
+def _estimate_g_for_merged(trace: np.ndarray, est, p: int, fudge_factor: float
+                           ) -> tuple[np.ndarray, float]:
+    """Pre-estimate AR(p) coefficients + noise for a freshly-merged trace.
+
+    Returns (g_fudged, sn). The fudge_factor is applied inside
+    `estimate_ar_coefficients` (mirrors core.deconvolution._pick_g, which is
+    the path used by every non-merge foopsi call). Feeding the result to
+    `_foopsi_one_cell` as `g_init` ensures the user's fudge_factor is honored
+    for merged cells — otherwise CaImAn re-estimates g internally and ignores
+    the fudge factor entirely.
+    """
+    from caiman_sorter_py.core.proc_init import (
+        compute_noise, _batch_autocov, estimate_ar_coefficients,
+    )
+    from caiman_sorter_py.core.state import get_init_param
+    init = est.init_params_caiman
+    lags = int(get_init_param(init, "lags", 5))
+
+    trace2d = trace[np.newaxis, :]
+    sn      = float(compute_noise(trace2d)[0])
+    acf     = _batch_autocov(trace2d, lags + max(p, 1))[0]
+    g       = estimate_ar_coefficients(p, sn, acf,
+                                       lags=lags, fudge_factor=fudge_factor)
+    return np.asarray(g, dtype=np.float64), sn
+
+
 def _metrics_for_new_cell(trace: np.ndarray, S: np.ndarray, est, ops) -> dict:
     """Compute the full set of proc metrics for one freshly-created cell."""
     from scipy.stats import skew as scipy_skew
@@ -429,10 +455,19 @@ def apply_create_new(est, proc, ops, pairs: list[DuplicatePair],
 
         A_new, trace_new = _compute_merged_at(est, pair, method)
 
-        # Run foopsi to get C, S, g for the new cell (no g_init → caiman estimates)
+        # Pre-estimate AR coefficients for the merged trace and apply the user's
+        # fudge_factor (mirrors the upstream-application pattern in
+        # core.deconvolution._pick_g). Without this the foopsi call below
+        # passes g=None, CaImAn re-estimates g internally, and our fudge_factor
+        # is silently ignored for the merged cell.
+        g_init, sn_init = _estimate_g_for_merged(
+            trace_new, est, fp_p, ops.foopsi.fudge_factor,
+        )
+
         try:
             c_new, sp_new, g_new = _foopsi_one_cell(
-                trace_new.astype(np.float64), g_init=None, sn=None,
+                trace_new.astype(np.float64),
+                g_init=g_init, sn=sn_init,
                 p=fp_p, solver=fp_solver,
             )
         except Exception as exc:

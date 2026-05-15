@@ -244,13 +244,13 @@ def _write_deconv(g: h5py.Group, dr: DeconvResults,
                   n_cells: int, n_frames: int) -> None:
     """Store per-cell DeconvResults as dense arrays + a `done` mask.
 
-    S and C are (n_cells, n_frames) float32, with zeros where the cell hasn't
+    S and C are (n_cells, n_frames) float64, with zeros where the cell hasn't
     been processed. `done` is a (n_cells,) bool mask of which cells have data.
     g is variable-length: stored as (n_cells, max_p) padded with NaN.
     """
     done = np.zeros(n_cells, dtype=bool)
-    S_arr = np.zeros((n_cells, n_frames), dtype=np.float32)
-    C_arr = np.zeros((n_cells, n_frames), dtype=np.float32)
+    S_arr = np.zeros((n_cells, n_frames), dtype=np.float64)
+    C_arr = np.zeros((n_cells, n_frames), dtype=np.float64)
 
     max_p = 0
     for i in range(min(n_cells, len(dr.g))):
@@ -258,7 +258,7 @@ def _write_deconv(g: h5py.Group, dr: DeconvResults,
         if gi is not None:
             max_p = max(max_p, int(np.asarray(gi).size))
 
-    g_arr = np.full((n_cells, max(max_p, 1)), np.nan, dtype=np.float32)
+    g_arr = np.full((n_cells, max(max_p, 1)), np.nan, dtype=np.float64)
 
     for i in range(n_cells):
         s = dr.S[i] if i < len(dr.S) else None
@@ -268,11 +268,11 @@ def _write_deconv(g: h5py.Group, dr: DeconvResults,
             continue
         done[i] = True
         if s is not None:
-            S_arr[i, :len(s)] = np.asarray(s, dtype=np.float32)
+            S_arr[i, :len(s)] = np.asarray(s, dtype=np.float64)
         if c is not None:
-            C_arr[i, :len(c)] = np.asarray(c, dtype=np.float32)
+            C_arr[i, :len(c)] = np.asarray(c, dtype=np.float64)
         if gi is not None:
-            gi_arr = np.asarray(gi, dtype=np.float32).flatten()
+            gi_arr = np.asarray(gi, dtype=np.float64).flatten()
             g_arr[i, :gi_arr.size] = gi_arr
 
     g.create_dataset("S",    data=S_arr, compression="gzip", chunks=True)
@@ -437,6 +437,6 @@ def _read_init_params(g: h5py.Group) -> dict:
 # ----------------------------------------------------------------------
 
 def _save_2d(g: h5py.Group, name: str, arr: np.ndarray) -> None:
+    """Save a 2-D array in its native dtype with gzip — preserves float64 from CaImAn."""
     arr = np.asarray(arr)
-    g.create_dataset(name, data=arr.astype(np.float32, copy=False),
-                     compression="gzip", chunks=True)
+    g.create_dataset(name, data=arr, compression="gzip", chunks=True)

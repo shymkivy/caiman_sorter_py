@@ -33,9 +33,18 @@ class ImagePanel(QWidget):
         # Cached MATLAB-equivalent background pieces:
         #   _bkg_comp_weights : (n_cells,) per-cell mean denoised activity
         #   _bkg_bg_img       : (h, w)   spatial-background contribution (b @ mean(f))
-        # Both are computed once on data_loaded and reused for every refresh.
+        # Computed once on data_loaded; reused for every refresh.
         self._bkg_comp_weights = None
         self._bkg_bg_img       = None
+        # Per-side sums recomputed when proc.accepted changes globally
+        # (data_loaded / cells_reevaluated) and incrementally updated on each
+        # single-cell toggle to avoid a full A @ weights rebuild per click.
+        self._acc_components   = None    # (h, w) sum(A[:, accepted], axis=1)
+        self._rej_components   = None    # (h, w) sum(A[:, rejected], axis=1)
+        self._acc_wcomp_signed = None    # (h, w) A[:, accepted] @ mean(C)[accepted]
+        self._rej_wcomp_signed = None    # (h, w) A[:, rejected] @ mean(C)[rejected]
+        # Lazy per-cell footprint cache (dense (h, w) — only built for toggled cells)
+        self._footprint_cache: dict[int, "np.ndarray"] = {}
         self._build_ui()
         self._connect_session()
 
@@ -195,9 +204,14 @@ class ImagePanel(QWidget):
     # ------------------------------------------------------------------
 
     def _on_data_loaded(self) -> None:
-        """Invalidate the bkg cache so it's rebuilt for the new dataset."""
+        """Invalidate all caches so they're rebuilt for the new dataset."""
         self._bkg_comp_weights = None
         self._bkg_bg_img       = None
+        self._acc_components   = None
+        self._rej_components   = None
+        self._acc_wcomp_signed = None
+        self._rej_wcomp_signed = None
+        self._footprint_cache.clear()
         self.refresh_images()
 
     def refresh_images(self) -> None:
@@ -216,7 +230,67 @@ class ImagePanel(QWidget):
             self.rejected_canvas.draw_idle()
 
     def update_cell_toggle(self, cell_idx: int) -> None:
-        self.refresh_images()
+        """Incremental refresh after one cell's accept/reject is toggled.
+
+        Avoids the full refresh_images cost (cla + N Line2D rebuild + two
+        full A @ weights matmuls) by:
+          - updating the four cached side-sum arrays with a single ±delta
+          - re-rendering each AxesImage via set_array + set_clim
+          - moving the cell's contour Line2D between axes
+          - updating labels and re-highlighting the current cell
+        Falls back to refresh_images if any cache is missing (e.g. an early
+        toggle before the first data_loaded refresh).
+        """
+        proc = self.session.proc
+        est  = self.session.est
+        if proc is None or est is None:
+            return
+        if (self._acc_components is None or self._rej_components is None
+                or self._acc_wcomp_signed is None or self._rej_wcomp_signed is None
+                or self._accepted_im is None or self._rejected_im is None):
+            self.refresh_images()
+            return
+
+        now_accepted = bool(proc.accepted[cell_idx])
+        fp = self._footprint_for(cell_idx)
+        w  = float(self._bkg_comp_weights[cell_idx])
+
+        # Shift this cell's contribution from the old side to the new side.
+        if now_accepted:
+            src_comp, dst_comp = self._rej_components,   self._acc_components
+            src_w,    dst_w    = self._rej_wcomp_signed, self._acc_wcomp_signed
+        else:
+            src_comp, dst_comp = self._acc_components,   self._rej_components
+            src_w,    dst_w    = self._acc_wcomp_signed, self._rej_wcomp_signed
+        src_comp -= fp
+        dst_comp += fp
+        src_w    -= w * fp
+        dst_w    += w * fp
+
+        # Re-render both composite images from the updated caches
+        acc_img = self._build_bg_image_for_side(True)
+        rej_img = self._build_bg_image_for_side(False)
+        self._accepted_im.set_data(acc_img)
+        self._rejected_im.set_data(rej_img)
+        acc_clim = self._clim(acc_img)
+        rej_clim = self._clim(rej_img)
+        self._accepted_im.set_clim(acc_clim["vmin"], acc_clim["vmax"])
+        self._rejected_im.set_clim(rej_clim["vmin"], rej_clim["vmax"])
+
+        # Move the cell's contour between axes
+        line = self._contour_lines[cell_idx] if cell_idx < len(self._contour_lines) else None
+        if line is not None:
+            target_ax = self.accepted_ax if now_accepted else self.rejected_ax
+            if line.axes is not target_ax:
+                try:
+                    line.remove()
+                except (ValueError, NotImplementedError):
+                    pass
+                target_ax.add_line(line)
+
+        self._update_labels()
+        # Re-apply current-cell highlight + canvas draws via existing helper
+        self.highlight_cell(self.session.current_cell)
 
     def highlight_cell(self, cell_idx: int) -> None:
         """Highlight the current cell's contour; dim all others."""
@@ -261,20 +335,73 @@ class ImagePanel(QWidget):
             self._style_ax(ax)
 
     def _ensure_bkg_cache(self) -> None:
-        """Pre-compute per-cell weights and the spatial-background image once.
+        """Pre-compute per-cell weights, the spatial-bg image, and side sums.
 
         Mirrors MATLAB f_cs_initialize_GUI_params.m:
             bkg_comp_weights = mean(est.C, 2)               % (n_cells, 1)
             bkg_bgkcomp      = reshape(mean(est.f) * est.b, dims)
+
+        Also caches the four per-side composite arrays so single-cell toggles
+        can apply a delta instead of recomputing two sparse @ dense matmuls.
         """
         est = self.session.est
         if est is None:
             return
         n_cells = est.C.shape[0]
-        if self._bkg_comp_weights is None or len(self._bkg_comp_weights) != n_cells:
+        weights_stale = (
+            self._bkg_comp_weights is None
+            or len(self._bkg_comp_weights) != n_cells
+        )
+        if weights_stale:
             self._bkg_comp_weights = np.mean(est.C, axis=1)
         if self._bkg_bg_img is None:
             self._bkg_bg_img = self._compute_bg_component_image(est)
+        # Side-sum arrays must be rebuilt whenever n_cells changes OR the
+        # global accepted mask is unknown (None).
+        sides_stale = (
+            weights_stale
+            or self._acc_components is None
+            or self._acc_components.shape != est.dims
+        )
+        if sides_stale and self.session.proc is not None:
+            self._rebuild_side_sums()
+
+    def _rebuild_side_sums(self) -> None:
+        """Rebuild the four per-side composite cache arrays from current proc.accepted."""
+        est  = self.session.est
+        proc = self.session.proc
+        if est is None or proc is None:
+            return
+        dims = est.dims
+        weights = np.asarray(self._bkg_comp_weights)
+        acc_mask = np.asarray(proc.accepted, dtype=bool)
+        rej_mask = ~acc_mask
+
+        def _comp_sum(mask):
+            if not mask.any():
+                return np.zeros(dims, dtype=np.float64)
+            return np.asarray(est.A[:, mask].sum(axis=1)).ravel().reshape(dims, order="F")
+
+        def _wcomp(mask):
+            if not mask.any():
+                return np.zeros(dims, dtype=np.float64)
+            return np.asarray(est.A[:, mask] @ weights[mask]).ravel().reshape(dims, order="F")
+
+        self._acc_components   = _comp_sum(acc_mask)
+        self._rej_components   = _comp_sum(rej_mask)
+        self._acc_wcomp_signed = _wcomp(acc_mask)
+        self._rej_wcomp_signed = _wcomp(rej_mask)
+
+    def _footprint_for(self, cell_idx: int) -> np.ndarray:
+        """Return cell_idx's spatial footprint as a dense (h, w) array, cached."""
+        fp = self._footprint_cache.get(cell_idx)
+        if fp is None:
+            est = self.session.est
+            fp = np.asarray(est.A[:, cell_idx].toarray()).ravel().reshape(
+                est.dims, order="F"
+            )
+            self._footprint_cache[cell_idx] = fp
+        return fp
 
     @staticmethod
     def _compute_bg_component_image(est) -> np.ndarray | None:
@@ -302,40 +429,30 @@ class ImagePanel(QWidget):
         flat   = b @ mean_f                # (n_pixels,)
         return np.asarray(flat).ravel().reshape(est.dims, order="F")
 
-    def _build_bg_image(self, mask: np.ndarray) -> np.ndarray:
-        est      = self.session.est
-        dims     = est.dims
-        bkg_mode = self.bkg_combo.currentText()
-        if not mask.any():
-            base = np.zeros(dims)
-            if bkg_mode == "W comp + bkg" and self._bkg_bg_img is not None:
-                base = base + self._bkg_bg_img
-            return base
+    def _build_bg_image_for_side(self, accepted_side: bool) -> np.ndarray:
+        """Return the composite background image for one side of the panel.
 
-        A_sub = est.A[:, mask]
+        Reads from the pre-built side-sum caches (`_acc_components` etc.)
+        instead of recomputing A @ weights every refresh.
+        """
+        bkg_mode = self.bkg_combo.currentText()
+        comp     = self._acc_components if accepted_side else self._rej_components
+        wcomp_s  = self._acc_wcomp_signed if accepted_side else self._rej_wcomp_signed
+        if comp is None or wcomp_s is None:
+            return np.zeros(self.session.est.dims)
         if bkg_mode == "Components":
-            img = np.asarray(A_sub.sum(axis=1)).ravel().reshape(dims, order="F")
-        else:
-            weights = np.asarray(self._bkg_comp_weights)[mask]
-            img = np.asarray(A_sub @ weights).ravel().reshape(dims, order="F")
-            if bkg_mode == "W comp + bkg" and self._bkg_bg_img is not None:
-                # Literal MATLAB formula: weighted comp + spatial-background image.
-                # `img` may be mixed-sign here (Python CaImAn ships baseline-
-                # subtracted C); that's intentional — the bkg dominates and the
-                # signed contribution modulates on top of it.
-                img = img + self._bkg_bg_img
-            elif bkg_mode == "Weighted comp":
-                # Display magnitude so all active cells appear as bright spots on
-                # a dark background instead of the (technically MATLAB-correct
-                # but visually inverted) mid-grey background with cells dipping
-                # below it.
-                img = np.abs(img)
-        return img
+            return comp
+        if bkg_mode == "W comp + bkg":
+            # Signed comp + bkg; bkg dominates and modulation rides on top.
+            return wcomp_s + (self._bkg_bg_img if self._bkg_bg_img is not None
+                              else 0.0)
+        # "Weighted comp": display magnitude so cells with mixed-sign weights
+        # (Python CaImAn ships baseline-subtracted C) still read as bright.
+        return np.abs(wcomp_s)
 
     def _draw_backgrounds(self) -> None:
-        proc    = self.session.proc
-        acc_img = self._build_bg_image(proc.accepted)
-        rej_img = self._build_bg_image(~proc.accepted)
+        acc_img = self._build_bg_image_for_side(True)
+        rej_img = self._build_bg_image_for_side(False)
 
         self._accepted_im = self.accepted_ax.imshow(
             acc_img, cmap=self.CMAP, aspect="equal", origin="lower",
