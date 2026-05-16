@@ -32,20 +32,30 @@ def tau_to_g(tau_decay: float, tau_rise: Optional[float] = None,
              dt: float = 1.0) -> np.ndarray:
     """Convert continuous-time tau values to discrete AR coefficients.
 
-    AR(1): g = [exp(-dt / tau_decay)]
-    AR(2): g = [g_d + g_r, -g_d * g_r]
-           where g_d = exp(-dt / tau_decay), g_r = exp(-dt / tau_rise)
+    Mirrors MATLAB `tau_c2d.m`. The continuous impulse response is the
+    rise-decay envelope
+        h(t) = (1 - exp(-t / tau_rise)) * exp(-t / tau_decay)
+    whose two poles in the s-plane are at
+        p1 = 1 / tau_decay
+        p2 = 1 / tau_decay + 1 / tau_rise
+    (closed form of `eig([-(2/τd+1/τr), -(τr+τd)/(τr·τd²); 1 0])`).
+    The discrete poles are `exp(-dt * p_i)`, so the AR(2) coefficients are
+        g[0] = exp(-dt*p1) + exp(-dt*p2)
+        g[1] = -exp(-dt*p1) * exp(-dt*p2)
+    AR(1) (when `tau_rise` is missing): `g = [exp(-dt / tau_decay)]`.
 
     Args:
         tau_decay: Calcium decay tau in seconds.
-        tau_rise:  Calcium rise tau in seconds. If None / <= 0, returns AR(1).
+        tau_rise:  Calcium rise tau in seconds. If None / <= 0 / inf, returns AR(1).
         dt:        Frame period in seconds.
     """
-    g_d = float(np.exp(-dt / tau_decay))
-    if tau_rise is None or tau_rise <= 0:
+    p1  = 1.0 / tau_decay
+    g_d = float(np.exp(-dt * p1))
+    if tau_rise is None or tau_rise <= 0 or not np.isfinite(tau_rise):
         return np.array([g_d])
-    g_r = float(np.exp(-dt / tau_rise))
-    return np.array([g_d + g_r, -g_d * g_r])
+    p2   = p1 + 1.0 / tau_rise
+    g_rd = float(np.exp(-dt * p2))
+    return np.array([g_d + g_rd, -g_d * g_rd])
 
 
 def apply_fudge_factor(g: np.ndarray, fudge: float) -> np.ndarray:
@@ -72,25 +82,32 @@ def apply_fudge_factor(g: np.ndarray, fudge: float) -> np.ndarray:
 
 
 def _pick_g(proc, n_cell: int, params, dt: float) -> Optional[np.ndarray]:
-    """Choose AR coefficients for a cell and apply fudge_factor.
+    """Choose AR coefficients for a cell.
 
     Order: manual tau → cached gAR1/gAR2 → None (let CaImAn estimate).
-    Whichever non-None g is picked has `params.fudge_factor` applied to it.
+
+    `fudge_factor` is applied here ONLY for the manual-tau path. The cached
+    `proc.gAR1` / `proc.gAR2` values were already fudged inside
+    `initialize_proc` via `compute_ar_pair → estimate_ar_coefficients(...,
+    fudge_factor=init_fudge)`. Re-applying fudge here would double-shrink
+    the AR roots and diverge from the MATLAB pipeline (MATLAB's
+    `estimate_time_constant.m` applies fudge once during init and the
+    foopsi consumer reads pre-fudged g without re-fudging).
     """
     p = params.ar_order
-    fudge = float(getattr(params, "fudge_factor", 1.0))
 
     if params.manual_tau:
         g = (tau_to_g(params.tau_decay, None, dt) if p == 1
              else tau_to_g(params.tau_decay, params.tau_rise, dt))
-    elif p == 1 and proc.gAR1 is not None:
-        g = np.array([float(proc.gAR1[n_cell])])
-    elif p == 2 and proc.gAR2 is not None:
-        g = np.asarray(proc.gAR2[n_cell], dtype=float)
-    else:
-        return None     # caller will let CaImAn estimate from the trace
+        fudge = float(getattr(params, "fudge_factor", 1.0))
+        return apply_fudge_factor(g, fudge)
 
-    return apply_fudge_factor(g, fudge)
+    if p == 1 and proc.gAR1 is not None:
+        return np.array([float(proc.gAR1[n_cell])])
+    if p == 2 and proc.gAR2 is not None:
+        return np.asarray(proc.gAR2[n_cell], dtype=float)
+
+    return None     # caller will let CaImAn estimate from the trace
 
 
 # ----------------------------------------------------------------------
@@ -113,19 +130,23 @@ def _ensure_lists(deconv_results, n_cells: int) -> None:
 # ----------------------------------------------------------------------
 
 def compute_smooth_dfdt(data: np.ndarray, fr: float, params) -> np.ndarray:
-    """Pure smooth dF/dt computation for a (n_cells, n_frames) array.
+    """Smooth dF/dt computation — mirrors MATLAB f_smooth_dfdt3.m.
 
-    For each row:
-        deriv     = [0, diff(row)]
-        smoothed  = gaussian_filter1d(deriv, sigma_frames)
+    Pipeline (matches `caiman_sorter/caiman_sorter_functions/deconvolution_dep/
+    f_smooth_dfdt3.m`):
+        deriv      = [0, diff(row)]
+        smoothed   = gaussian_filter1d(deriv, sigma_frames)
+        if normalize: smoothed / max(smoothed)   # signed max, matches MATLAB
         if rectify : max(smoothed, 0)
-        if normalize: divide by per-cell peak
-        if apply_thresh: zero values below threshold_z * std
+
+    The optional `apply_thresh` / `threshold_z` step is NOT applied here —
+    it's a Python-only post-process available via `apply_smooth_dfdt_threshold`.
 
     Args:
         data:   (n_cells, n_frames) array of raw C + YrA traces.
         fr:     frame rate in Hz.
-        params: SmoothDfdtParams.
+        params: SmoothDfdtParams (only gauss_sigma / normalize / rectify are
+                read by this function).
 
     Returns:
         (n_cells, n_frames) smoothed-dF/dt array.
@@ -136,23 +157,32 @@ def compute_smooth_dfdt(data: np.ndarray, fr: float, params) -> np.ndarray:
     deriv = np.diff(data, axis=1, prepend=data[:, :1])
     out   = gaussian_filter1d(deriv, sigma=sigma_frames, axis=1, mode="reflect")
 
+    if params.normalize:
+        # Signed max, matching MATLAB `temp_data / max(temp_data)`. Guard
+        # against zero traces.
+        peak = out.max(axis=1, keepdims=True)
+        peak = np.where(peak == 0, 1.0, peak)
+        out = out / peak
+
     if params.rectify:
         np.maximum(out, 0, out=out)
 
-    if params.normalize:
-        peak = np.abs(out).max(axis=1, keepdims=True)
-        peak[peak == 0] = 1.0
-        out = out / peak
-
-    if params.apply_thresh and params.threshold_z > 0:
-        std = out.std(axis=1, keepdims=True)
-        std[std == 0] = 1.0
-        thr = params.threshold_z * std
-        # Zero values below threshold; shift survivors down by `thr` so the
-        # cut-off point sits at zero (rather than leaving a step at thr).
-        out = np.where(out > thr, out - thr, 0.0)
-
     return out
+
+
+def apply_smooth_dfdt_threshold(out: np.ndarray, params) -> np.ndarray:
+    """Optional post-process: zero values below `threshold_z * std` (per cell).
+
+    No-op when `params.apply_thresh` is False. Survivors are shifted down by
+    `thr` so the cut-off point sits at zero (no step discontinuity at `thr`).
+    This step does not exist in MATLAB — it's a Python-only addition.
+    """
+    if not (params.apply_thresh and params.threshold_z > 0):
+        return out
+    std = out.std(axis=1, keepdims=True)
+    std = np.where(std == 0, 1.0, std)
+    thr = params.threshold_z * std
+    return np.where(out > thr, out - thr, 0.0)
 
 
 def run_smooth_dfdt(est, proc, ops,
@@ -172,6 +202,7 @@ def run_smooth_dfdt(est, proc, ops,
 
     data = est.C[cells] + est.YrA[cells]
     out  = compute_smooth_dfdt(data, fr, ops.smooth_dfdt)
+    out  = apply_smooth_dfdt_threshold(out, ops.smooth_dfdt)
 
     _ensure_lists(proc.smooth_dfdt, n_cells_total)
     if proc.smooth_dfdt_std is None or len(proc.smooth_dfdt_std) != n_cells_total:
@@ -271,11 +302,23 @@ def _foopsi_one_cell(y: np.ndarray, g_init: Optional[np.ndarray],
     )
 
     g_out_arr = np.asarray(g_out, dtype=float).flatten()
-    roots = np.roots(np.concatenate([[1.0], -g_out_arr]))
-    gd    = float(np.max(np.abs(roots)))
+    gd = _pick_gd_slow_decay(g_out_arr)
     gd_vec = gd ** np.arange(len(y))
     c_full = np.asarray(c, dtype=float) + float(c1) * gd_vec + float(bl)
     return c_full, np.asarray(sp, dtype=float), g_out_arr
+
+
+def _pick_gd_slow_decay(g: np.ndarray) -> float:
+    """Return the dominant (slowest-decay) real root of `1 - g[0]z - g[1]z^2 - …`.
+
+    Mirrors MATLAB `f_cs_compute_constrained_foopsi_core.m:5`:
+        gd = max(roots([1, -g]))
+    i.e. the SIGNED maximum (not max-of-abs). Roots are projected onto the
+    real axis first — matching CaImAn's `estimate_time_constant` convention
+    where complex-conjugate pairs collapse to their shared real part.
+    """
+    roots = np.roots(np.concatenate([[1.0], -np.asarray(g, dtype=float).flatten()]))
+    return float(np.max(np.real(roots)))
 
 
 def run_foopsi(est, proc, ops,
@@ -332,11 +375,28 @@ def run_foopsi(est, proc, ops,
     if use_parallel:
         try:
             from joblib import Parallel, delayed
-            results = Parallel(n_jobs=-1, prefer="threads")(
-                delayed(_do)(job) for job in jobs
-            )
-            if progress_cb:
-                progress_cb(len(jobs), len(jobs))
+            # `return_as="generator"` (joblib >= 1.3) yields per-completion so
+            # progress_cb can fire incrementally instead of jumping from 0 to
+            # 100% only after the whole batch finishes. Falls back to the
+            # batched API if joblib is older.
+            try:
+                stream = Parallel(n_jobs=-1, prefer="threads",
+                                  return_as="generator")(
+                    delayed(_do)(job) for job in jobs
+                )
+                results = []
+                for i, r in enumerate(stream):
+                    results.append(r)
+                    if progress_cb:
+                        progress_cb(i + 1, len(jobs))
+            except TypeError:
+                # Older joblib without return_as — fall back to one-shot batch
+                # and a single end-of-run progress call.
+                results = Parallel(n_jobs=-1, prefer="threads")(
+                    delayed(_do)(job) for job in jobs
+                )
+                if progress_cb:
+                    progress_cb(len(jobs), len(jobs))
         except ImportError:
             use_parallel = False
 

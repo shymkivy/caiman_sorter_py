@@ -58,32 +58,45 @@ def find_duplicate_pairs(est, proc, ops) -> list[DuplicatePair]:
     if len(rows) == 0:
         return []
 
+    # Vectorised Pearson correlation matrix on z-scored traces. The per-pair
+    # Python loop is replaced with a single (n_acc, n_acc) matmul; for the
+    # candidate spatial pairs we then index in once.
     trace = (est.C + est.YrA)[idx_lut]         # (n_acc, n_frames)
     t_centered = trace - trace.mean(axis=1, keepdims=True)
     t_norm = np.linalg.norm(t_centered, axis=1)
     t_norm[t_norm == 0] = 1.0
+    t_z = t_centered / t_norm[:, np.newaxis]   # rows are unit-norm
 
-    pairs: list[DuplicatePair] = []
-    for r, c in zip(rows, cols):
-        corr = float((t_centered[r] @ t_centered[c]) / (t_norm[r] * t_norm[c]))
-        if corr > mp.temporal_thr:
-            pairs.append(DuplicatePair(
-                cell_a=int(idx_lut[r]),
-                cell_b=int(idx_lut[c]),
-                spatial_overlap=float(AA_lt[r, c]),
-                temporal_corr=corr,
-            ))
+    corr_pairs = np.einsum("ij,ij->i", t_z[rows], t_z[cols])  # (n_pair,)
+    keep = corr_pairs > mp.temporal_thr
+    if not keep.any():
+        return []
+    rows, cols, corr_pairs = rows[keep], cols[keep], corr_pairs[keep]
+    overlaps = AA_lt[rows, cols]
 
+    pairs = [
+        DuplicatePair(
+            cell_a=int(idx_lut[r]),
+            cell_b=int(idx_lut[c]),
+            spatial_overlap=float(o),
+            temporal_corr=float(cc),
+        )
+        for r, c, o, cc in zip(rows, cols, overlaps, corr_pairs)
+    ]
     pairs.sort(key=lambda p: -p.spatial_overlap)
     return pairs
 
 
 def sync_idx_components(est, proc) -> None:
-    """Regenerate est.idx_components / idx_components_bad from proc.accepted.
+    """Overwrite est.idx_components / idx_components_bad with current state.
 
-    `proc.accepted` is the single source of truth for acceptance state.
-    The cached index arrays in est must be rebuilt whenever it changes
-    (after merge, manual accept/reject from bulk operations, etc.).
+    `est.idx_components` is the pristine CaImAn-original record from load
+    time and should generally not be mutated. This helper exists for ad-hoc
+    use (one-off exports, tests) where a caller explicitly wants the
+    current-state indices materialized into the est fields.
+
+    Runtime sort flow does NOT call this; it derives current-state indices
+    from `proc.accepted` directly via `np.where(proc.accepted)[0]`.
     """
     acc = np.asarray(proc.accepted, dtype=bool)
     est.idx_components     = np.where(acc)[0].astype(np.int64)
@@ -146,8 +159,12 @@ def weighted_ave_preview(est, pair: DuplicatePair) -> dict:
 
     tr1 = (est.C[a] + est.YrA[a]).astype(float)
     tr2 = (est.C[b] + est.YrA[b]).astype(float)
-    n1 = float(np.linalg.norm(tr1 - tr1.min()))
-    n2 = float(np.linalg.norm(tr2 - tr2.min()))
+    # Baseline is min(C) only — matches MATLAB f_cs_find_similar_comp_core.m:28
+    # (NOT min(C + YrA); the residual YrA is excluded from the baseline).
+    base1 = float(est.C[a].min())
+    base2 = float(est.C[b].min())
+    n1 = float(np.linalg.norm(tr1 - base1))
+    n2 = float(np.linalg.norm(tr2 - base2))
     denom = n1 + n2 if (n1 + n2) > 0 else 1.0
     A_merged = (A1 * n1 + A2 * n2) / denom
 
@@ -200,8 +217,12 @@ def _compute_merged_at(est, pair: DuplicatePair, method: str
     tr2 = (est.C[b] + est.YrA[b]).astype(float)
 
     if method == "weighted ave":
-        n1 = float(np.linalg.norm(tr1 - tr1.min()))
-        n2 = float(np.linalg.norm(tr2 - tr2.min()))
+        # Baseline is min(C) only — matches MATLAB f_cs_find_similar_comp_core.m:28
+        # (NOT min(C + YrA); the residual YrA is excluded from the baseline).
+        base1 = float(est.C[a].min())
+        base2 = float(est.C[b].min())
+        n1 = float(np.linalg.norm(tr1 - base1))
+        n2 = float(np.linalg.norm(tr2 - base2))
         td = n1 + n2 if (n1 + n2) > 0 else 1.0
         A_new = (A1 * n1 + A2 * n2) / td
         s1, s2 = float(A1.sum()), float(A2.sum())
@@ -272,11 +293,10 @@ def _estimate_g_for_merged(trace: np.ndarray, est, p: int, fudge_factor: float
     the fudge factor entirely.
     """
     from caiman_sorter_py.core.proc_init import (
-        compute_noise, _batch_autocov, estimate_ar_coefficients,
+        _batch_autocov, compute_noise, estimate_ar_coefficients,
+        get_ar_init_params,
     )
-    from caiman_sorter_py.core.state import get_init_param
-    init = est.init_params_caiman
-    lags = int(get_init_param(init, "lags", 5))
+    _, _, _, _, lags = get_ar_init_params(est)
 
     trace2d = trace[np.newaxis, :]
     sn      = float(compute_noise(trace2d)[0])
@@ -290,17 +310,11 @@ def _metrics_for_new_cell(trace: np.ndarray, S: np.ndarray, est, ops) -> dict:
     """Compute the full set of proc metrics for one freshly-created cell."""
     from scipy.stats import skew as scipy_skew
     from caiman_sorter_py.core.proc_init import (
-        compute_noise, _batch_autocov, estimate_ar_coefficients,
-        compute_peaks_ave, compute_firing_stability, ar_to_tau,
+        _batch_autocov, compute_ar_pair, compute_firing_stability, compute_noise,
+        compute_peaks_ave, get_ar_init_params,
     )
 
-    from caiman_sorter_py.core.state import get_init_param
-    init = est.init_params_caiman
-    fr           = float(get_init_param(init, "fr", 30.0))
-    dt           = 1.0 / fr
-    ar_order     = int(get_init_param(init, "ar_order", 2))
-    fudge_factor = float(get_init_param(init, "fudge_factor", 0.99))
-    lags         = int(get_init_param(init, "lags", 5))
+    fr, dt, ar_order, fudge_factor, lags = get_ar_init_params(est)
 
     trace2d = trace[np.newaxis, :]
     S2d     = S[np.newaxis, :]
@@ -314,14 +328,9 @@ def _metrics_for_new_cell(trace: np.ndarray, S: np.ndarray, est, ops) -> dict:
 
     total_lags = lags + max(ar_order, 1)
     acf = _batch_autocov(trace2d, total_lags)[0]
-    g1 = estimate_ar_coefficients(1, noise_val, acf,
-                                   lags=lags, fudge_factor=fudge_factor)
-    g2 = estimate_ar_coefficients(ar_order, noise_val, acf,
-                                   lags=lags, fudge_factor=fudge_factor)
-    g2 = g2[:2] if len(g2) >= 2 else np.array([g2[0], 0.0])
-    tau1 = ar_to_tau(g1, dt)
-    tau2 = ar_to_tau(g2, dt)
-    tau2 = tau2[:2] if len(tau2) >= 2 else np.array([0.0, tau2[0]])
+    gAR1, gAR2, tauAR1, tauAR2 = compute_ar_pair(
+        noise_val, acf, ar_order, lags, fudge_factor, dt,
+    )
 
     return {
         "noise":            noise_val,
@@ -330,102 +339,11 @@ def _metrics_for_new_cell(trace: np.ndarray, S: np.ndarray, est, ops) -> dict:
         "num_zeros":        num_zeros_val,
         "SNR2_vals":        snr2,
         "firing_stab_vals": firing_stab_val,
-        "gAR1":             float(g1[0]),
-        "gAR2":             np.asarray(g2, dtype=float),
-        "tauAR1":           float(tau1[-1]),
-        "tauAR2":           np.asarray(tau2, dtype=float),
+        "gAR1":             gAR1,
+        "gAR2":             gAR2,
+        "tauAR1":           tauAR1,
+        "tauAR2":           tauAR2,
     }
-
-
-def _append_merged_cell(est, proc, *,
-                        A_new: np.ndarray, c_new: np.ndarray, yra_new: np.ndarray,
-                        sp_new: np.ndarray, g_new: np.ndarray,
-                        metrics: dict, parent_a: int, parent_b: int,
-                        foopsi_C: np.ndarray | None, foopsi_S: np.ndarray | None,
-                        foopsi_g: np.ndarray | None,
-                        contour: dict | None) -> int:
-    """Append one new merged cell to all est/proc arrays. Returns its index."""
-    from scipy.sparse import hstack, csc_matrix
-
-    new_idx  = int(est.A.shape[1])
-    n_frames = int(est.C.shape[1])
-
-    # --- est arrays ---
-    A_col = csc_matrix(A_new.reshape(-1, 1))
-    est.A = hstack([est.A, A_col]).tocsc()
-    est.C = np.vstack([est.C, c_new.reshape(1, -1).astype(est.C.dtype)])
-    est.YrA = np.vstack([est.YrA, yra_new.reshape(1, -1).astype(est.YrA.dtype)])
-    est.S = np.vstack([est.S, sp_new.reshape(1, -1).astype(est.S.dtype)])
-    est.F_dff = np.vstack([
-        est.F_dff,
-        np.zeros((1, n_frames), dtype=est.F_dff.dtype),
-    ])
-
-    # Per-cell scalars: use mean/max of parents (matches MATLAB)
-    snr_parents  = np.array([est.SNR_comp[parent_a], est.SNR_comp[parent_b]])
-    cnn_parents  = np.array([est.cnn_preds[parent_a], est.cnn_preds[parent_b]])
-    rval_parents = np.array([est.r_values[parent_a], est.r_values[parent_b]])
-    est.SNR_comp  = np.append(est.SNR_comp,  float(np.nanmean(snr_parents)))
-    est.cnn_preds = np.append(est.cnn_preds, float(np.nanmax(cnn_parents)))
-    est.r_values  = np.append(est.r_values,  float(np.nanmax(rval_parents)))
-
-    if est.neurons_sn is not None:
-        est.neurons_sn = np.append(est.neurons_sn, float(metrics["noise"]))
-
-    if est.g is not None and est.g.ndim == 2:
-        p = est.g.shape[0]
-        new_g = np.zeros((p, 1), dtype=est.g.dtype)
-        flat  = np.asarray(g_new, dtype=float).flatten()
-        new_g[:min(p, flat.size), 0] = flat[:p]
-        est.g = np.hstack([est.g, new_g])
-
-    if est.contours is not None:
-        est.contours.append(contour or {"coordinates": None, "CoM": None})
-
-    # Note: est.idx_components / idx_components_bad are regenerated from
-    # proc.accepted at the end of apply_create_new (single source of truth).
-
-    # --- proc arrays ---
-    proc.num_cells       += 1
-    proc.accepted         = np.append(proc.accepted,         True)
-    proc.accepted_core    = np.append(proc.accepted_core,    False)
-    proc.manual_override  = np.append(proc.manual_override,  True)
-    proc.noise            = np.append(proc.noise,            metrics["noise"])
-    proc.skewness         = np.append(proc.skewness,         metrics["skewness"])
-    proc.peaks_ave        = np.append(proc.peaks_ave,        metrics["peaks_ave"])
-    proc.num_zeros        = np.append(proc.num_zeros,        metrics["num_zeros"])
-    proc.SNR2_vals        = np.append(proc.SNR2_vals,        metrics["SNR2_vals"])
-    proc.firing_stab_vals = np.append(proc.firing_stab_vals, metrics["firing_stab_vals"])
-    proc.gAR1             = np.append(proc.gAR1,             metrics["gAR1"])
-    proc.tauAR1           = np.append(proc.tauAR1,           metrics["tauAR1"])
-    proc.gAR2             = np.vstack([proc.gAR2,
-                                       metrics["gAR2"].reshape(1, -1)])
-    proc.tauAR2           = np.vstack([proc.tauAR2,
-                                       metrics["tauAR2"].reshape(1, -1)])
-
-    # DeconvResults lists — pad to current n_cells then write the new entries.
-    # These lists are sparse: cells without deconv results have None at their index.
-    def _pad(lst, length, fill=None):
-        while len(lst) < length:
-            lst.append(fill)
-
-    target = int(proc.num_cells)
-    for lst in (proc.smooth_dfdt.S, proc.smooth_dfdt.C, proc.smooth_dfdt.g,
-                proc.foopsi.S, proc.foopsi.C, proc.foopsi.g):
-        _pad(lst, target)
-
-    if proc.smooth_dfdt_std is not None:
-        if len(proc.smooth_dfdt_std) < target:
-            proc.smooth_dfdt_std = np.concatenate([
-                proc.smooth_dfdt_std,
-                np.zeros(target - len(proc.smooth_dfdt_std)),
-            ])
-
-    proc.foopsi.S[new_idx] = foopsi_S
-    proc.foopsi.C[new_idx] = foopsi_C
-    proc.foopsi.g[new_idx] = foopsi_g
-
-    return new_idx
 
 
 def apply_create_new(est, proc, ops, pairs: list[DuplicatePair],
@@ -449,12 +367,15 @@ def apply_create_new(est, proc, ops, pairs: list[DuplicatePair],
 
     from caiman_sorter_py.core.deconvolution import _foopsi_one_cell
 
-    kept_list: list = []
-    rej_list:  list = []
     fp_p = int(getattr(ops.foopsi, "ar_order", 1))
     fp_solver = getattr(ops.foopsi, "solver", "oasis")
     contour_thr = float(getattr(ops, "contour_thr", 0.01))
 
+    # Collect per-pair records first; the actual array appends happen in one
+    # batched pass at the end. Doing them inside the loop would mean N×hstack
+    # on est.A and N×np.append on every per-cell array — O(n_cells × n_pairs).
+    records: list[dict] = []
+    rej_list: list = []
     for i, pair in enumerate(pairs):
         if log_cb:
             log_cb(f"Merging pair {i + 1}/{len(pairs)}: cells {pair.cell_a} + {pair.cell_b}")
@@ -462,10 +383,9 @@ def apply_create_new(est, proc, ops, pairs: list[DuplicatePair],
         A_new, trace_new = _compute_merged_at(est, pair, method)
 
         # Pre-estimate AR coefficients for the merged trace and apply the user's
-        # fudge_factor (mirrors the upstream-application pattern in
-        # core.deconvolution._pick_g). Without this the foopsi call below
-        # passes g=None, CaImAn re-estimates g internally, and our fudge_factor
-        # is silently ignored for the merged cell.
+        # fudge_factor (mirrors core.deconvolution._pick_g). Without this the
+        # foopsi call below passes g=None, CaImAn re-estimates g internally,
+        # and the user's fudge_factor is silently ignored.
         g_init, sn_init = _estimate_g_for_merged(
             trace_new, est, fp_p, ops.foopsi.fudge_factor,
         )
@@ -483,32 +403,219 @@ def apply_create_new(est, proc, ops, pairs: list[DuplicatePair],
             sp_new = np.zeros_like(trace_new)
             g_new = np.array([0.95])
 
-        yra_new = trace_new - c_new
-        metrics = _metrics_for_new_cell(trace_new, sp_new, est, ops)
-        contour = _compute_contour_for(A_new, est.dims, thr=contour_thr)
-
-        new_idx = _append_merged_cell(
-            est, proc,
-            A_new=A_new, c_new=c_new, yra_new=yra_new,
-            sp_new=sp_new, g_new=g_new,
-            metrics=metrics,
-            parent_a=pair.cell_a, parent_b=pair.cell_b,
-            foopsi_C=c_new.astype(np.float32),
-            foopsi_S=sp_new.astype(np.float32),
-            foopsi_g=g_new,
-            contour=contour,
-        )
-
-        # Reject the two parents (preserve existing rejections idempotently)
-        proc.accepted[pair.cell_a] = False
-        proc.accepted[pair.cell_b] = False
-        proc.manual_override[pair.cell_a] = True
-        proc.manual_override[pair.cell_b] = True
-
-        kept_list.append(new_idx)
+        records.append(dict(
+            pair=pair,
+            A_new=A_new,
+            c_new=c_new,
+            yra_new=trace_new - c_new,
+            sp_new=sp_new,
+            g_new=g_new,
+            metrics=_metrics_for_new_cell(trace_new, sp_new, est, ops),
+            contour=_compute_contour_for(A_new, est.dims, thr=contour_thr),
+        ))
         rej_list.append((int(pair.cell_a), int(pair.cell_b)))
 
+    if not records:
+        return {"n_changed": 0, "kept": [], "rejected": []}
+
+    kept_list = _batch_append_merged_cells(est, proc, records)
     return {"n_changed": len(kept_list), "kept": kept_list, "rejected": rej_list}
+
+
+def _batch_append_merged_cells(est, proc, records: list[dict]) -> list[int]:
+    """Append N merged cells to est/proc with a single batched pass per array.
+
+    Replaces N successive `_append_merged_cell` calls (which would reallocate
+    every per-cell array N times — O(n_cells × n_pairs)). Returns the new
+    indices in order.
+    """
+    from scipy.sparse import csc_matrix, hstack
+
+    n_new = len(records)
+    new_indices = list(range(int(est.A.shape[1]),
+                             int(est.A.shape[1]) + n_new))
+    n_frames = int(est.C.shape[1])
+
+    # ---- est sparse / 2-D arrays --------------------------------------------
+    new_cols = [csc_matrix(r["A_new"].reshape(-1, 1)) for r in records]
+    est.A = hstack([est.A] + new_cols, format="csc")
+    est.C     = np.vstack([est.C]   + [r["c_new"].reshape(1, -1).astype(est.C.dtype)   for r in records])
+    est.YrA   = np.vstack([est.YrA] + [r["yra_new"].reshape(1, -1).astype(est.YrA.dtype) for r in records])
+    est.S     = np.vstack([est.S]   + [r["sp_new"].reshape(1, -1).astype(est.S.dtype)  for r in records])
+    est.F_dff = np.vstack([est.F_dff,
+                            np.zeros((n_new, n_frames), dtype=est.F_dff.dtype)])
+
+    # ---- est per-cell scalars (mean/max of parents — matches MATLAB) -------
+    def _parent_scalar(arr, agg):
+        vals = []
+        for r in records:
+            p = r["pair"]
+            vals.append(float(agg(np.array([arr[p.cell_a], arr[p.cell_b]]))))
+        return np.array(vals)
+
+    est.SNR_comp  = np.concatenate([est.SNR_comp,  _parent_scalar(est.SNR_comp,  np.nanmean)])
+    est.cnn_preds = np.concatenate([est.cnn_preds, _parent_scalar(est.cnn_preds, np.nanmax)])
+    est.r_values  = np.concatenate([est.r_values,  _parent_scalar(est.r_values,  np.nanmax)])
+
+    if est.neurons_sn is not None:
+        est.neurons_sn = np.concatenate([
+            est.neurons_sn,
+            np.array([r["metrics"]["noise"] for r in records]),
+        ])
+
+    if est.g is not None and est.g.ndim == 2:
+        p = est.g.shape[0]
+        new_g = np.zeros((p, n_new), dtype=est.g.dtype)
+        for j, r in enumerate(records):
+            flat = np.asarray(r["g_new"], dtype=float).flatten()
+            new_g[:min(p, flat.size), j] = flat[:p]
+        est.g = np.hstack([est.g, new_g])
+
+    if est.contours is not None:
+        for r in records:
+            est.contours.append(r["contour"] or {"coordinates": None, "CoM": None})
+
+    # ---- proc 1-D arrays ---------------------------------------------------
+    old_n = int(proc.num_cells)
+    proc.num_cells += n_new
+    proc.accepted        = np.concatenate([proc.accepted,        np.ones(n_new, dtype=bool)])
+    proc.accepted_core   = np.concatenate([proc.accepted_core,   np.zeros(n_new, dtype=bool)])
+    proc.manual_override = np.concatenate([proc.manual_override, np.ones(n_new, dtype=bool)])
+
+    def _metric_col(key, dtype=np.float64):
+        return np.array([r["metrics"][key] for r in records], dtype=dtype)
+
+    def _extend_1d(attr_name: str, new_vals: np.ndarray) -> None:
+        """Append new_vals to proc.<attr_name>; init to empty if None.
+
+        Tolerates partially-initialised Proc (e.g. init_proc_minimal output
+        where only `noise` is set). Without this, np.concatenate([None, x])
+        raises and the merge appears to corrupt the state instead of failing
+        cleanly.
+        """
+        cur = getattr(proc, attr_name)
+        if cur is None:
+            cur = np.full(old_n, np.nan, dtype=new_vals.dtype)
+        setattr(proc, attr_name, np.concatenate([cur, new_vals]))
+
+    _extend_1d("noise",            _metric_col("noise"))
+    _extend_1d("skewness",         _metric_col("skewness"))
+    _extend_1d("peaks_ave",        _metric_col("peaks_ave"))
+    _extend_1d("num_zeros",        _metric_col("num_zeros"))
+    _extend_1d("SNR2_vals",        _metric_col("SNR2_vals"))
+    _extend_1d("firing_stab_vals", _metric_col("firing_stab_vals"))
+    _extend_1d("gAR1",             _metric_col("gAR1"))
+    _extend_1d("tauAR1",           _metric_col("tauAR1"))
+
+    def _extend_2d(attr_name: str, new_rows: np.ndarray) -> None:
+        cur = getattr(proc, attr_name)
+        if cur is None:
+            cur = np.full((old_n, new_rows.shape[1]), np.nan, dtype=new_rows.dtype)
+        setattr(proc, attr_name, np.vstack([cur, new_rows]))
+
+    _extend_2d("gAR2",   np.stack([r["metrics"]["gAR2"]   for r in records]))
+    _extend_2d("tauAR2", np.stack([r["metrics"]["tauAR2"] for r in records]))
+
+    # ---- DeconvResults lists ----------------------------------------------
+    target = int(proc.num_cells)
+    for lst in (proc.smooth_dfdt.S, proc.smooth_dfdt.C, proc.smooth_dfdt.g,
+                proc.foopsi.S, proc.foopsi.C, proc.foopsi.g):
+        while len(lst) < target:
+            lst.append(None)
+    if proc.smooth_dfdt_std is not None and len(proc.smooth_dfdt_std) < target:
+        proc.smooth_dfdt_std = np.concatenate([
+            proc.smooth_dfdt_std,
+            np.zeros(target - len(proc.smooth_dfdt_std)),
+        ])
+    for new_idx, r in zip(new_indices, records):
+        proc.foopsi.S[new_idx] = r["sp_new"].astype(np.float32)
+        proc.foopsi.C[new_idx] = r["c_new"].astype(np.float32)
+        proc.foopsi.g[new_idx] = r["g_new"]
+
+    # ---- Parent acceptance flags ------------------------------------------
+    parent_ids = np.array(
+        [p for r in records for p in (r["pair"].cell_a, r["pair"].cell_b)]
+    )
+    proc.accepted[parent_ids]        = False
+    proc.manual_override[parent_ids] = True
+
+    # ---- Merge history (for "Reset merges" undo) --------------------------
+    if proc.merge_parents is None:
+        proc.merge_parents = []
+    for r in records:
+        proc.merge_parents.append(
+            (int(r["pair"].cell_a), int(r["pair"].cell_b))
+        )
+
+    return new_indices
+
+
+def reset_all_merges(est, proc) -> int:
+    """Undo every merge that has been recorded on `proc.merge_parents`.
+
+    Drops all merged-in cells (those at index >= est.num_cells_original) from
+    every per-cell array on est and proc, then restores each merge parent's
+    acceptance state to its auto-eval value (`proc.accepted_core[p]`) and
+    clears its `manual_override` flag.
+
+    No-op if `proc.merge_parents` is empty. Returns the number of merged
+    cells that were undone.
+    """
+    if proc.merge_parents is None or len(proc.merge_parents) == 0:
+        return 0
+
+    n_orig = int(est.num_cells_original or proc.num_cells)
+    n_undone = int(proc.num_cells) - n_orig
+    if n_undone <= 0:
+        proc.merge_parents = []
+        return 0
+
+    # ---- Truncate est ------------------------------------------------------
+    est.A = est.A.tocsc()[:, :n_orig]
+    est.C     = est.C[:n_orig]
+    est.YrA   = est.YrA[:n_orig]
+    est.S     = est.S[:n_orig]
+    est.F_dff = est.F_dff[:n_orig]
+    est.SNR_comp  = est.SNR_comp[:n_orig]
+    est.cnn_preds = est.cnn_preds[:n_orig]
+    est.r_values  = est.r_values[:n_orig]
+    if est.neurons_sn is not None:
+        est.neurons_sn = est.neurons_sn[:n_orig]
+    if est.g is not None and est.g.ndim == 2:
+        est.g = est.g[:, :n_orig]
+    if est.contours is not None:
+        del est.contours[n_orig:]
+
+    # ---- Truncate proc per-cell arrays ------------------------------------
+    proc.accepted        = proc.accepted[:n_orig]
+    proc.accepted_core   = proc.accepted_core[:n_orig]
+    proc.manual_override = proc.manual_override[:n_orig]
+    for name in ("noise", "skewness", "peaks_ave", "num_zeros",
+                 "SNR2_vals", "firing_stab_vals",
+                 "gAR1", "tauAR1", "smooth_dfdt_std"):
+        v = getattr(proc, name, None)
+        if v is not None:
+            setattr(proc, name, v[:n_orig])
+    for name in ("gAR2", "tauAR2"):
+        v = getattr(proc, name, None)
+        if v is not None:
+            setattr(proc, name, v[:n_orig])
+
+    # ---- Truncate DeconvResults lists -------------------------------------
+    for lst in (proc.smooth_dfdt.S, proc.smooth_dfdt.C, proc.smooth_dfdt.g,
+                proc.foopsi.S,      proc.foopsi.C,      proc.foopsi.g):
+        del lst[n_orig:]
+
+    # ---- Restore parents to auto-eval state -------------------------------
+    parents = {p for pair in proc.merge_parents for p in pair if p < n_orig}
+    for p in parents:
+        proc.accepted[p]        = bool(proc.accepted_core[p])
+        proc.manual_override[p] = False
+
+    # ---- Finalise ---------------------------------------------------------
+    proc.num_cells = n_orig
+    proc.merge_parents = []
+    return n_undone
 
 
 def apply_merge(est, proc, ops, pairs: list[DuplicatePair],
@@ -519,13 +626,15 @@ def apply_merge(est, proc, ops, pairs: list[DuplicatePair],
     The other four methods create a new merged component per pair via
     apply_create_new, matching MATLAB f_cs_find_similar_comp_core.m.
 
-    Also re-syncs est.idx_components / est.idx_components_bad from proc.accepted
-    so downstream consumers (.mat export, session save) see consistent indices.
+    `est.idx_components` / `est.idx_components_bad` are NOT updated — they're
+    the pristine CaImAn-original record from load time. Live acceptance state
+    is `proc.accepted` (the single source of truth). Callers that need the
+    current-state index arrays should derive them on demand via
+    `np.where(proc.accepted)[0]`.
     """
     method = ops.merge.method
     if method == "choose best snr":
         result = apply_choose_best_snr(proc, pairs)
     else:
         result = apply_create_new(est, proc, ops, pairs, log_cb=log_cb)
-    sync_idx_components(est, proc)
     return result

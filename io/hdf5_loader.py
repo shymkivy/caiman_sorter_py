@@ -92,30 +92,17 @@ def load_hdf5(path: str | Path, load_rejected: bool = True,
         g    = g_m.T if g_m.ndim == 2 and g_m.shape[1] > 0 else np.zeros((1, n_main))
         idx_comp_bad = idx_bad
 
-    n_cells = A.shape[1]
-    contours = _compute_contours(A, dims, contour_thr)
-
-    return Estimates(
-        A=A,
-        C=C,
-        YrA=YrA,
-        S=S,
-        F_dff=F_dff,
-        SNR_comp=SNR,
-        cnn_preds=cnn,
-        r_values=rval,
+    return Estimates.from_arrays(
+        A=A, dims=dims, contour_thr=contour_thr,
+        C=C, YrA=YrA, S=S, F_dff=F_dff,
+        SNR_comp=SNR, cnn_preds=cnn, r_values=rval,
         g=g,
-        dims=dims,
         idx_components=idx_comp,
         idx_components_bad=idx_comp_bad,
-        contours=contours,
-        sn=sn,
-        b=b,
-        f=bg_f,
+        sn=sn, b=b, f=bg_f, neurons_sn=nsn,
         eval_params_caiman=eval_params,
         init_params_caiman=init_params,
-        num_cells_original=n_cells,
-        neurons_sn=nsn,
+        num_cells_original=A.shape[1],
     )
 
 
@@ -234,20 +221,28 @@ def _h5_dataset_to_value(ds):
 
     CaImAn serialises Python None / type names as |S* byte strings — we decode
     those and surface 'NoneType' as Python None so the dict round-trips cleanly.
+    Embedded NUL bytes (from fixed-length |S32 padding) are stripped so the
+    values can be re-saved through h5py's variable-length string type.
     """
+    def _clean(s):
+        if isinstance(s, (bytes, np.bytes_)):
+            s = s.decode(errors="replace")
+        if isinstance(s, str):
+            return s.replace("\x00", "")
+        return s
+
     shape = ds.shape
     if shape == ():
         v = ds[()]
-        if isinstance(v, (bytes, np.bytes_)):
-            s = v.decode(errors="replace")
+        if isinstance(v, (bytes, np.bytes_, str)):
+            s = _clean(v)
             return None if s == "NoneType" else s
         if isinstance(v, np.generic):
             return v.item()
         return v
     arr = ds[:]
-    if arr.dtype.kind in ("S", "O"):
-        decoded = [(b.decode(errors="replace") if isinstance(b, (bytes, np.bytes_)) else b)
-                   for b in arr.ravel().tolist()]
+    if arr.dtype.kind in ("S", "O", "U"):
+        decoded = [_clean(b) for b in arr.ravel().tolist()]
         # Collapse single-element arrays to a bare scalar
         if len(decoded) == 1:
             s = decoded[0]

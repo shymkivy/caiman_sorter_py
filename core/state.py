@@ -72,6 +72,9 @@ class Estimates:
     r_values: np.ndarray                 # (n_cells,) spatial correlation
     g: np.ndarray                        # (2, n_cells) AR model coefficients
     dims: tuple[int, int]                # (height, width) of the FOV
+    # Pristine CaImAn-original eval indices from load time, NOT live state.
+    # The live acceptance mask is proc.accepted (single source of truth).
+    # Anywhere current-state indices are needed: np.where(proc.accepted)[0].
     idx_components: np.ndarray           # CaImAn-accepted cell indices (0-based)
     idx_components_bad: np.ndarray       # CaImAn-rejected cell indices (0-based)
     contours: Optional[list] = None      # list of dicts from get_contours()
@@ -82,6 +85,78 @@ class Estimates:
     eval_params_caiman: Optional[dict] = None   # thresholds used by CaImAn
     init_params_caiman: Optional[dict] = None   # data/init params from CaImAn
     num_cells_original: int = 0          # set after load; used for reset
+
+    # ------------------------------------------------------------------
+    # Factory
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_arrays(cls, *, A: csc_matrix, dims: tuple[int, int],
+                    **kwargs) -> "Estimates":
+        """Build an Estimates with sensible defaults for missing fields.
+
+        Used by the three loaders (`io/hdf5_loader.load_hdf5`,
+        `io/session._read_est`, `io/mat_loader._read_est`) so that adding
+        a new Estimates field requires changing only ONE default in this
+        factory — not three loader-specific construction sites that have
+        already drifted in subtle ways.
+
+        Required: `A` (sparse, shape (n_pixels, n_cells)) and `dims`.
+
+        Per-cell time-series and metric fields default to zero arrays sized
+        to `A.shape[1]`. Background fields (`sn`/`b`/`f`/`neurons_sn`) and
+        the param dicts default to None. `idx_components` defaults to
+        "accept all" — most callers override this, but it's a sane
+        starting point. `contours` is computed from `A` at the supplied
+        `thr` if not provided AND `dims` is non-degenerate.
+        """
+        n_cells = int(A.shape[1])
+        n_frames = int(kwargs.get("C").shape[1]) if "C" in kwargs and kwargs["C"] is not None else 0
+
+        def _zeros_2d(name, dtype=np.float64):
+            v = kwargs.get(name)
+            return v if v is not None else np.zeros((n_cells, n_frames), dtype=dtype)
+
+        def _zeros_1d(name, dtype=np.float64):
+            v = kwargs.get(name)
+            return v if v is not None else np.zeros(n_cells, dtype=dtype)
+
+        contour_thr = float(kwargs.pop("contour_thr", 0.01))
+        contours = kwargs.get("contours", None)
+        if contours is None and dims and dims[0] > 0:
+            try:
+                from caiman_sorter_py.core.contours import compute_contours
+                contours = compute_contours(A, dims, thr=contour_thr)
+            except Exception:
+                contours = None
+
+        return cls(
+            A=A,
+            C=_zeros_2d("C"),
+            YrA=_zeros_2d("YrA"),
+            S=_zeros_2d("S"),
+            F_dff=_zeros_2d("F_dff"),
+            SNR_comp=_zeros_1d("SNR_comp"),
+            cnn_preds=_zeros_1d("cnn_preds", dtype=np.float32),
+            r_values=_zeros_1d("r_values"),
+            g=kwargs.get("g") if kwargs.get("g") is not None
+              else np.zeros((1, n_cells)),
+            dims=dims,
+            idx_components=(kwargs.get("idx_components")
+                            if kwargs.get("idx_components") is not None
+                            else np.arange(n_cells, dtype=np.int64)),
+            idx_components_bad=(kwargs.get("idx_components_bad")
+                                if kwargs.get("idx_components_bad") is not None
+                                else np.array([], dtype=np.int64)),
+            contours=contours,
+            sn=kwargs.get("sn"),
+            neurons_sn=kwargs.get("neurons_sn"),
+            b=kwargs.get("b"),
+            f=kwargs.get("f"),
+            eval_params_caiman=kwargs.get("eval_params_caiman") or None,
+            init_params_caiman=kwargs.get("init_params_caiman") or None,
+            num_cells_original=int(kwargs.get("num_cells_original") or n_cells),
+        )
 
 
 @dataclass
@@ -122,6 +197,11 @@ class Proc:
     smooth_dfdt: DeconvResults = field(default_factory=DeconvResults)
     smooth_dfdt_std: Optional[np.ndarray] = None  # (n_cells,) std of smooth_dfdt.S
     foopsi: DeconvResults = field(default_factory=DeconvResults)
+
+    # Per-merge parent record. Index k of this list is the parents of the
+    # cell appended at est.num_cells_original + k. Drives the "Reset merges"
+    # undo affordance — emptied by reset_all_merges() in core.merge.
+    merge_parents: list = field(default_factory=list)
 
 
 @dataclass
@@ -221,6 +301,33 @@ class Ops:
     contour_thr: float = 0.01            # amplitude threshold for contour tracing (fraction of peak)
     browse_path: str = ""
     ops_path: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# Single source of truth for the persistable Ops layout. Used by the QSettings
+# round-trip in ui/main_window.py and the HDF5 round-trip in io/session.py so
+# that adding a new field to a sub-dataclass needs zero corresponding edits in
+# serializer code (it shows up automatically via dataclasses.fields()).
+# --------------------------------------------------------------------------- #
+
+# Sub-dataclass attr on Ops → short key prefix used in QSettings / mat / etc.
+OPS_SUB_PREFIXES: dict[str, str] = {
+    "eval_caiman": "ec",
+    "eval_reject": "er",
+    "spikes":      "sp",
+    "smooth_dfdt": "sd",
+    "foopsi":      "fp",
+    "merge":       "mg",
+}
+
+# Top-level scalar attrs on Ops that should round-trip. Order doesn't matter.
+OPS_TOP_FIELD_NAMES: tuple[str, ...] = (
+    "eval_method",
+    "load_caiman_rejected",
+    "save_tag",
+    "save_as_mat",
+    "contour_thr",
+)
 
 
 class Session:

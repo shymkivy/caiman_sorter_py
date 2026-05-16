@@ -34,7 +34,8 @@ class TracePanel(QWidget):
         self.session = session
         self._lines: dict    = {}   # name → Line2D
         self._raw_data: dict = {}   # name → np.ndarray (unscaled)
-        self._t: np.ndarray | None = None   # time axis in seconds
+        self._t: np.ndarray | None = None   # time axis in seconds (cached on data load)
+        self._fr_cached: float | None = None  # sampling rate cached alongside _t
         self._last_cell: int | None = None  # last cell shown; reset xlim/ylim only when this changes
         self._build_ui()
         self._connect_session()
@@ -128,6 +129,14 @@ class TracePanel(QWidget):
     def _on_data_loaded(self) -> None:
         self._init_lines()
         self._last_cell = None   # force a full-view reset on first cell shown
+        # Cache the time axis once — only depends on n_frames and fr, both of
+        # which are fixed for a given session.
+        from caiman_sorter_py.core.state import get_init_param
+        est = self.session.est
+        if est is not None:
+            fr = float(get_init_param(est.init_params_caiman, "fr", 30))
+            self._t = np.arange(est.C.shape[1]) / fr
+            self._fr_cached = fr
         if self.session.proc:
             self.show_cell(self.session.current_cell)
 
@@ -160,13 +169,17 @@ class TracePanel(QWidget):
         if not self._lines or self.session.est is None:
             return
 
-        from caiman_sorter_py.core.state import get_init_param
         est  = self.session.est
         proc = self.session.proc
-        fr   = float(get_init_param(est.init_params_caiman, "fr", 30))
+        # _t and fr are cached in _on_data_loaded; only recompute on the unusual
+        # path where show_cell runs before that listener fired.
         n_frames = est.C.shape[1]
-
-        self._t = np.arange(n_frames) / fr
+        if self._t is None or len(self._t) != n_frames:
+            from caiman_sorter_py.core.state import get_init_param
+            fr = float(get_init_param(est.init_params_caiman, "fr", 30))
+            self._t = np.arange(n_frames) / fr
+            self._fr_cached = fr
+        fr = self._fr_cached
 
         def _deconv_get(lst):
             try:
@@ -197,9 +210,12 @@ class TracePanel(QWidget):
         # The stored proc.smooth_dfdt.S is only updated when the user clicks the
         # "Run smooth dF/dt" button (for all cells); display always reflects the
         # live params, even before any Run.
-        from caiman_sorter_py.core.deconvolution import compute_smooth_dfdt
+        from caiman_sorter_py.core.deconvolution import (
+            apply_smooth_dfdt_threshold, compute_smooth_dfdt,
+        )
         single = (est.C[cell_idx:cell_idx + 1] + est.YrA[cell_idx:cell_idx + 1])
-        dfdt = compute_smooth_dfdt(single, fr, self.session.ops.smooth_dfdt)[0]
+        dfdt = compute_smooth_dfdt(single, fr, self.session.ops.smooth_dfdt)
+        dfdt = apply_smooth_dfdt_threshold(dfdt, self.session.ops.smooth_dfdt)[0]
 
         self._raw_data = {
             "raw":      est.C[cell_idx] + est.YrA[cell_idx],

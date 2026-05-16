@@ -35,39 +35,65 @@ def compute_contours(A: csc_matrix, dims: tuple[int, int],
     except ImportError:
         return _fallback_caiman(A, dims)
 
+    height, width = dims
+    A = A.tocsc()
+    indptr  = A.indptr
+    indices = A.indices
+    data    = A.data
     n_cells = A.shape[1]
     result  = []
 
     for i in range(n_cells):
-        fp = np.asarray(A[:, i].todense()).ravel().reshape(dims, order="F")
-        fp_max = float(fp.max())
+        start, end = int(indptr[i]), int(indptr[i + 1])
+        if start == end:
+            result.append({"coordinates": None, "CoM": None})
+            continue
 
+        nz_px = indices[start:end]
+        vals  = data[start:end]
+        # Linear pixel index → (row, col) via column-major layout (Fortran order):
+        #   px = row + col * height  =>  row = px % height,  col = px // height
+        nz_rows = nz_px %  height
+        nz_cols = nz_px // height
+
+        fp_max = float(vals.max())
         if fp_max == 0:
             result.append({"coordinates": None, "CoM": None})
             continue
 
-        binary = (fp > thr * fp_max).astype(np.float32)
+        # Threshold and select kept pixels
+        thr_abs   = thr * fp_max
+        keep_mask = vals > thr_abs
+        if not keep_mask.any():
+            result.append({"coordinates": None, "CoM": None})
+            continue
+        kept_rows = nz_rows[keep_mask]
+        kept_cols = nz_cols[keep_mask]
+        kept_vals = vals[keep_mask]
 
-        # Weighted centre of mass
-        rows, cols = np.where(binary)
-        if len(rows):
-            w   = fp[rows, cols]
-            com = [float(np.average(rows, weights=w)),
-                   float(np.average(cols, weights=w))]
-        else:
-            com = None
+        # Weighted centre of mass on the kept pixels
+        com = [float(np.average(kept_rows, weights=kept_vals)),
+               float(np.average(kept_cols, weights=kept_vals))]
 
-        # Find outer contour of the binary mask (boundary between 0 and 1)
-        segs = find_contours(binary, level=0.5)
+        # Allocate a bounding-box buffer (+1 pad on each side so find_contours
+        # at level=0.5 traces a closed loop even when the footprint touches
+        # the FOV edge). Clip the global bbox to [0, dims).
+        pad = 1
+        r0 = max(0, int(kept_rows.min()) - pad)
+        r1 = min(height - 1, int(kept_rows.max()) + pad)
+        c0 = max(0, int(kept_cols.min()) - pad)
+        c1 = min(width  - 1, int(kept_cols.max()) + pad)
+        box = np.zeros((r1 - r0 + 1, c1 - c0 + 1), dtype=np.float32)
+        box[kept_rows - r0, kept_cols - c0] = 1.0
+
+        segs = find_contours(box, level=0.5)
         if not segs:
             result.append({"coordinates": None, "CoM": com})
             continue
-
-        # Take the longest segment (outer boundary, not holes)
         seg = max(segs, key=len)
-        # skimage returns (row, col); convert to (x, y) = (col, row) for imshow
-        coords_xy = np.column_stack([seg[:, 1], seg[:, 0]])
-
+        # Offset back to global coords. skimage returns (row, col); we emit
+        # (x=col, y=row) for imshow.
+        coords_xy = np.column_stack([seg[:, 1] + c0, seg[:, 0] + r0])
         result.append({"coordinates": coords_xy, "CoM": com})
 
     return result

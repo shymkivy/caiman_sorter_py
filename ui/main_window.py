@@ -12,8 +12,12 @@ from PyQt5.QtWidgets import (
     QFileDialog, QMessageBox,
 )
 
+from dataclasses import fields
+
 from caiman_sorter_py import __version__
-from caiman_sorter_py.core.state import Session
+from caiman_sorter_py.core.state import (
+    OPS_SUB_PREFIXES, OPS_TOP_FIELD_NAMES, Session,
+)
 from caiman_sorter_py.ui.image_panel import ImagePanel
 from caiman_sorter_py.ui.merge_panel import MergePanel
 from caiman_sorter_py.ui.nav_panel import NavPanel
@@ -252,6 +256,10 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self._settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
         self.session = Session()
+        # Path of the file behind the currently loaded session — cached so save
+        # dialogs can derive a default filename even after the load worker
+        # QThread has been dropped.
+        self._loaded_path: str = ""
         self.setWindowTitle(f"CaImAn Sorter v{__version__}")
         self.resize(1600, 950)
         self._build_ui()
@@ -436,6 +444,10 @@ class MainWindow(QMainWindow):
         cf.addRow(self.recompute_contours_btn)
         v.addWidget(contour_group)
 
+        # Reset actions — destructive session-wide buttons live here, not in
+        # the right-side eval panel. ParamsPanel owns the widgets + signals.
+        v.addWidget(self.params_panel.build_reset_group())
+
         v.addStretch()
         return w
 
@@ -502,7 +514,17 @@ class MainWindow(QMainWindow):
         if fmt == "ops":
             try:
                 from caiman_sorter_py.io.session import load_ops
-                self.session.ops = load_ops(path)
+                loaded = load_ops(path)
+                # _ops.h5 deliberately doesn't persist save_tag / save_as_mat
+                # / browse_path / ops_path (per-user prefs, not session state).
+                # Preserve the user's current values for those across a reload
+                # so the operation only overwrites the params the file owns.
+                prev = self.session.ops
+                loaded.save_tag    = prev.save_tag
+                loaded.save_as_mat = prev.save_as_mat
+                loaded.browse_path = prev.browse_path
+                loaded.ops_path    = prev.ops_path
+                self.session.ops   = loaded
                 self.params_panel.load_ops()
                 if hasattr(self, "contour_thr_spin"):
                     self.contour_thr_spin.setValue(self.session.ops.contour_thr)
@@ -545,7 +567,8 @@ class MainWindow(QMainWindow):
                 if hasattr(self, "load_rejected_chk"):
                     self.load_rejected_chk.setChecked(loaded_ops.load_caiman_rejected)
             self.session.load_data(est, proc)
-            self._settings.setValue("last_file", self._load_worker.path)
+            self._loaded_path = self._load_worker.path
+            self._settings.setValue("last_file", self._loaded_path)
             n_acc = int(proc.accepted.sum())
             self.log(f"Ready: {proc.num_cells} cells ({n_acc} accepted, "
                      f"{proc.num_cells - n_acc} rejected), dims={est.dims}.")
@@ -557,6 +580,9 @@ class MainWindow(QMainWindow):
         finally:
             self._loading_dlg.done(0)
             self.load_btn.setEnabled(True)
+            # Drop the worker QThread (and its refs to est/proc/ops) — it has
+            # finished and we shouldn't pin those payloads in memory.
+            self._load_worker = None
 
     def _on_load_failed(self, msg: str, tb: str) -> None:
         try:
@@ -566,6 +592,7 @@ class MainWindow(QMainWindow):
         finally:
             self._loading_dlg.done(0)
             self.load_btn.setEnabled(True)
+            self._load_worker = None
 
     # ------------------------------------------------------------------
     # Deconvolution (foopsi) async runner
@@ -604,6 +631,7 @@ class MainWindow(QMainWindow):
         finally:
             self._foopsi_dlg.done(0)
             self.params_panel.run_foopsi_btn.setEnabled(True)
+            self._foopsi_worker = None
 
     def _on_foopsi_failed(self, msg: str, tb: str) -> None:
         try:
@@ -613,6 +641,7 @@ class MainWindow(QMainWindow):
         finally:
             self._foopsi_dlg.done(0)
             self.params_panel.run_foopsi_btn.setEnabled(True)
+            self._foopsi_worker = None
 
     def _on_save(self) -> None:
         """Save full session to an .h5 file (self-contained)."""
@@ -622,7 +651,7 @@ class MainWindow(QMainWindow):
         # Sync UI controls into ops so what we save matches what's on screen
         self.params_panel.sync_to_ops()
 
-        source = self._load_worker.path if hasattr(self, "_load_worker") else ""
+        source = self._loaded_path
         tag = self.session.ops.save_tag or ""
         default = self._default_save_path(source, suffix=f"{tag}.h5")
         path, _ = QFileDialog.getSaveFileName(
@@ -672,6 +701,7 @@ class MainWindow(QMainWindow):
             self._saving_dlg.done(0)
             self.save_btn.setEnabled(True)
             self.save_ops_btn.setEnabled(True)
+            self._save_worker = None
 
     def _on_save_failed(self, msg: str, tb: str, which: str) -> None:
         try:
@@ -686,6 +716,7 @@ class MainWindow(QMainWindow):
             self._saving_dlg.done(0)
             self.save_btn.setEnabled(True)
             self.save_ops_btn.setEnabled(True)
+            self._save_worker = None
 
     def _mat_sidecar_path(self, h5_path: str) -> str:
         """Derive the .mat sidecar path from the chosen .h5 save path.
@@ -699,7 +730,7 @@ class MainWindow(QMainWindow):
     def _on_save_ops(self) -> None:
         """Save the ops/parameters to a small _ops.h5 file."""
         self.params_panel.sync_to_ops()
-        source = self._load_worker.path if hasattr(self, "_load_worker") else ""
+        source = self._loaded_path
         tag = self.session.ops.save_tag or ""
         default = self._default_save_path(source, suffix=f"{tag}_ops.h5")
         path, _ = QFileDialog.getSaveFileName(
@@ -829,172 +860,65 @@ class MainWindow(QMainWindow):
         return out
 
     def _save_ops_settings(self) -> None:
-        """Persist all Ops fields to QSettings.
+        """Persist every Ops field to QSettings.
 
-        NOTE: When adding new Ops / sub-param fields, add them here and in
-        _restore_ops_settings so they survive across sessions.
+        Driven by `OPS_SUB_PREFIXES` and `OPS_TOP_FIELD_NAMES` in core/state —
+        adding a new field to a sub-dataclass requires zero edits here.
         """
         s   = self._settings
         ops = self.session.ops
-        ec  = ops.eval_caiman
-        er  = ops.eval_reject
-        sp  = ops.spikes
-        sd  = ops.smooth_dfdt
-        fp  = ops.foopsi
 
-        s.setValue("ops/eval_method", ops.eval_method)
+        for name in OPS_TOP_FIELD_NAMES:
+            s.setValue(f"ops/{name}", getattr(ops, name))
 
-        s.setValue("ops/ec/snr_thresh",         ec.snr_thresh)
-        s.setValue("ops/ec/snr_lowest_thresh",  ec.snr_lowest_thresh)
-        s.setValue("ops/ec/cnn_thresh",         ec.cnn_thresh)
-        s.setValue("ops/ec/cnn_lowest_thresh",  ec.cnn_lowest_thresh)
-        s.setValue("ops/ec/rval_thresh",        ec.rval_thresh)
-        s.setValue("ops/ec/rval_lowest_thresh", ec.rval_lowest_thresh)
-
-        s.setValue("ops/er/use_snr_caiman",       er.use_snr_caiman)
-        s.setValue("ops/er/snr_caiman",           er.snr_caiman)
-        s.setValue("ops/er/use_snr2",             er.use_snr2)
-        s.setValue("ops/er/snr2",                 er.snr2)
-        s.setValue("ops/er/use_cnn",              er.use_cnn)
-        s.setValue("ops/er/cnn",                  er.cnn)
-        s.setValue("ops/er/use_rvalues",          er.use_rvalues)
-        s.setValue("ops/er/rvalues",              er.rvalues)
-        s.setValue("ops/er/use_min_sig_frac",     er.use_min_sig_frac)
-        s.setValue("ops/er/min_sig_frac",         er.min_sig_frac)
-        s.setValue("ops/er/use_firing_stability", er.use_firing_stability)
-        s.setValue("ops/er/firing_stability",     er.firing_stability)
-        s.setValue("ops/er/use_skewness",         er.use_skewness)
-        s.setValue("ops/er/skewness",             er.skewness)
-
-        s.setValue("ops/sp/smooth",       sp.smooth)
-        s.setValue("ops/sp/smooth_sigma", sp.smooth_sigma)
-        s.setValue("ops/sp/scale",        sp.scale)
-        s.setValue("ops/sp/shift",        sp.shift)
-
-        s.setValue("ops/sd/gauss_sigma",  sd.gauss_sigma)
-        s.setValue("ops/sd/rectify",      sd.rectify)
-        s.setValue("ops/sd/normalize",    sd.normalize)
-        s.setValue("ops/sd/apply_thresh", sd.apply_thresh)
-        s.setValue("ops/sd/threshold_z",  sd.threshold_z)
-        s.setValue("ops/sd/scale",        sd.scale)
-        s.setValue("ops/sd/shift",        sd.shift)
-
-        s.setValue("ops/fp/solver",       fp.solver)
-        s.setValue("ops/fp/ar_order",     fp.ar_order)
-        s.setValue("ops/fp/manual_tau",   fp.manual_tau)
-        s.setValue("ops/fp/tau_decay",    fp.tau_decay)
-        s.setValue("ops/fp/tau_rise",     fp.tau_rise)
-        s.setValue("ops/fp/fudge_factor", fp.fudge_factor)
-        s.setValue("ops/fp/smooth_s",     fp.smooth_s)
-        s.setValue("ops/fp/smooth_sigma", fp.smooth_sigma)
-        s.setValue("ops/fp/scale",        fp.scale)
-        s.setValue("ops/fp/shift",        fp.shift)
-
-        s.setValue("ops/load_caiman_rejected", ops.load_caiman_rejected)
-        s.setValue("ops/save_tag",             ops.save_tag)
-        s.setValue("ops/save_as_mat",          ops.save_as_mat)
-        s.setValue("ops/contour_thr",          ops.contour_thr)
-
-        mg = ops.merge
-        s.setValue("ops/mg/method",            mg.method)
-        s.setValue("ops/mg/spatial_thr",       mg.spatial_thr)
-        s.setValue("ops/mg/temporal_thr",      mg.temporal_thr)
-        s.setValue("ops/mg/use_accepted_only", mg.use_accepted_only)
+        for attr_name, prefix in OPS_SUB_PREFIXES.items():
+            sub = getattr(ops, attr_name)
+            for fld in fields(sub):
+                s.setValue(f"ops/{prefix}/{fld.name}", getattr(sub, fld.name))
 
     def _restore_ops_settings(self) -> None:
         """Load persisted Ops fields from QSettings.
 
-        NOTE: When adding new Ops / sub-param fields, add them here and in
-        _save_ops_settings so they survive across sessions.
+        Driven by `OPS_SUB_PREFIXES` and `OPS_TOP_FIELD_NAMES` in core/state.
+        Each field's existing default value drives the type coercion — bool
+        defaults coerce strings via the truthy-token check, numeric defaults
+        use int()/float(), string defaults use str().
         """
         s   = self._settings
         ops = self.session.ops
-        ec  = ops.eval_caiman
-        er  = ops.eval_reject
-        sp  = ops.spikes
-        sd  = ops.smooth_dfdt
-        fp  = ops.foopsi
 
-        def _f(key, default):
-            v = s.value(key)
-            return float(v) if v is not None else default
-
-        def _b(key, default):
-            v = s.value(key)
-            if v is None:
+        def _coerce(raw, default):
+            if raw is None:
                 return default
-            return v in (True, "true", "1", 1)
+            # QSettings returns strings on read; coerce by the default's type.
+            if isinstance(default, bool):
+                return raw in (True, "true", "1", 1)
+            if isinstance(default, int) and not isinstance(default, bool):
+                return int(raw)
+            if isinstance(default, float):
+                return float(raw)
+            return str(raw)
 
-        def _i(key, default):
-            v = s.value(key)
-            return int(v) if v is not None else default
+        for name in OPS_TOP_FIELD_NAMES:
+            default = getattr(ops, name)
+            setattr(ops, name, _coerce(s.value(f"ops/{name}"), default))
 
-        def _s(key, default):
-            v = s.value(key)
-            return str(v) if v is not None else default
+        for attr_name, prefix in OPS_SUB_PREFIXES.items():
+            sub = getattr(ops, attr_name)
+            for fld in fields(sub):
+                default = getattr(sub, fld.name)
+                setattr(sub, fld.name,
+                        _coerce(s.value(f"ops/{prefix}/{fld.name}"), default))
 
-        ops.eval_method = _s("ops/eval_method", ops.eval_method)
-
-        ec.snr_thresh         = _f("ops/ec/snr_thresh",         ec.snr_thresh)
-        ec.snr_lowest_thresh  = _f("ops/ec/snr_lowest_thresh",  ec.snr_lowest_thresh)
-        ec.cnn_thresh         = _f("ops/ec/cnn_thresh",         ec.cnn_thresh)
-        ec.cnn_lowest_thresh  = _f("ops/ec/cnn_lowest_thresh",  ec.cnn_lowest_thresh)
-        ec.rval_thresh        = _f("ops/ec/rval_thresh",        ec.rval_thresh)
-        ec.rval_lowest_thresh = _f("ops/ec/rval_lowest_thresh", ec.rval_lowest_thresh)
-
-        er.use_snr_caiman       = _b("ops/er/use_snr_caiman",       er.use_snr_caiman)
-        er.snr_caiman           = _f("ops/er/snr_caiman",           er.snr_caiman)
-        er.use_snr2             = _b("ops/er/use_snr2",             er.use_snr2)
-        er.snr2                 = _f("ops/er/snr2",                 er.snr2)
-        er.use_cnn              = _b("ops/er/use_cnn",              er.use_cnn)
-        er.cnn                  = _f("ops/er/cnn",                  er.cnn)
-        er.use_rvalues          = _b("ops/er/use_rvalues",          er.use_rvalues)
-        er.rvalues              = _f("ops/er/rvalues",              er.rvalues)
-        er.use_min_sig_frac     = _b("ops/er/use_min_sig_frac",     er.use_min_sig_frac)
-        er.min_sig_frac         = _f("ops/er/min_sig_frac",         er.min_sig_frac)
-        er.use_firing_stability = _b("ops/er/use_firing_stability", er.use_firing_stability)
-        er.firing_stability     = _f("ops/er/firing_stability",     er.firing_stability)
-        er.use_skewness         = _b("ops/er/use_skewness",         er.use_skewness)
-        er.skewness             = _f("ops/er/skewness",             er.skewness)
-
-        sp.smooth       = _b("ops/sp/smooth",       sp.smooth)
-        sp.smooth_sigma = _f("ops/sp/smooth_sigma", sp.smooth_sigma)
-        sp.scale        = _f("ops/sp/scale",        sp.scale)
-        sp.shift        = _f("ops/sp/shift",        sp.shift)
-
-        sd.gauss_sigma  = _f("ops/sd/gauss_sigma",  sd.gauss_sigma)
-        sd.rectify      = _b("ops/sd/rectify",      sd.rectify)
-        sd.normalize    = _b("ops/sd/normalize",    sd.normalize)
-        sd.apply_thresh = _b("ops/sd/apply_thresh", sd.apply_thresh)
-        sd.threshold_z  = _f("ops/sd/threshold_z",  sd.threshold_z)
-        sd.scale        = _f("ops/sd/scale",        sd.scale)
-        sd.shift        = _f("ops/sd/shift",        sd.shift)
-
-        fp.solver       = _s("ops/fp/solver",       fp.solver)
-        fp.ar_order     = _i("ops/fp/ar_order",     fp.ar_order)
-        fp.manual_tau   = _b("ops/fp/manual_tau",   fp.manual_tau)
-        fp.tau_decay    = _f("ops/fp/tau_decay",    fp.tau_decay)
-        fp.tau_rise     = _f("ops/fp/tau_rise",     fp.tau_rise)
-        fp.fudge_factor = _f("ops/fp/fudge_factor", fp.fudge_factor)
-        fp.smooth_s     = _b("ops/fp/smooth_s",     fp.smooth_s)
-        fp.smooth_sigma = _f("ops/fp/smooth_sigma", fp.smooth_sigma)
-        fp.scale        = _f("ops/fp/scale",        fp.scale)
-        fp.shift        = _f("ops/fp/shift",        fp.shift)
-
-        ops.load_caiman_rejected = _b("ops/load_caiman_rejected", ops.load_caiman_rejected)
-        self.load_rejected_chk.setChecked(ops.load_caiman_rejected)
-        ops.save_tag = _s("ops/save_tag", ops.save_tag)
-        self.save_tag_edit.setText(ops.save_tag)
-        ops.save_as_mat = _b("ops/save_as_mat", ops.save_as_mat)
-        self.save_as_mat_chk.setChecked(ops.save_as_mat)
-        ops.contour_thr = _f("ops/contour_thr", ops.contour_thr)
-        self.contour_thr_spin.setValue(ops.contour_thr)
-
-        mg = ops.merge
-        mg.method            = _s("ops/mg/method",            mg.method)
-        mg.spatial_thr       = _f("ops/mg/spatial_thr",       mg.spatial_thr)
-        mg.temporal_thr      = _f("ops/mg/temporal_thr",      mg.temporal_thr)
-        mg.use_accepted_only = _b("ops/mg/use_accepted_only", mg.use_accepted_only)
+        # Sync UI widgets that mirror specific top-level ops fields.
+        if hasattr(self, "load_rejected_chk"):
+            self.load_rejected_chk.setChecked(ops.load_caiman_rejected)
+        if hasattr(self, "save_tag_edit"):
+            self.save_tag_edit.setText(ops.save_tag)
+        if hasattr(self, "save_as_mat_chk"):
+            self.save_as_mat_chk.setChecked(ops.save_as_mat)
+        if hasattr(self, "contour_thr_spin"):
+            self.contour_thr_spin.setValue(ops.contour_thr)
         if hasattr(self, "merge_panel"):
             self.merge_panel.load_ops()
 

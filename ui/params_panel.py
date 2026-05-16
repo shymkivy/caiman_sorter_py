@@ -27,6 +27,41 @@ class ParamsPanel(QWidget):
         layout.addWidget(self._build_eval_tab())
         # Pre-build deconv panel so run_deconv_btn exists before _connect_session runs.
         self._deconv_panel = self._build_deconv_tab()
+        # Pre-build the reset group too. The widget is owned by ParamsPanel
+        # (signals + enable state are wired in _connect_session) but it lives
+        # in the center "Params" tab via main_window._build_params_tab —
+        # not inside this right-side panel.
+        self._reset_group = self._build_reset_group()
+
+    def build_reset_group(self) -> "QGroupBox":
+        """Return the Reset groupbox for placement in the main-window Params tab."""
+        return self._reset_group
+
+    def _build_reset_group(self) -> "QGroupBox":
+        self.reset_group = QGroupBox("Reset")
+        rg = QHBoxLayout(self.reset_group)
+        rg.setContentsMargins(4, 4, 4, 4)
+        rg.setSpacing(6)
+
+        self.reset_manual_btn = QPushButton("Reset manual edits")
+        self.reset_manual_btn.setEnabled(False)
+        self.reset_manual_btn.setToolTip(
+            "Clear every manual accept/reject and revert all cells to their\n"
+            "last automatic-evaluation state (proc.accepted_core).\n"
+            "Asks for confirmation — this can't be undone."
+        )
+        rg.addWidget(self.reset_manual_btn)
+
+        self.reset_merges_btn = QPushButton("Reset merges")
+        self.reset_merges_btn.setEnabled(False)
+        self.reset_merges_btn.setToolTip(
+            "Undo every merge in this session.\n"
+            "Drops all merged-in cells and restores each merge's parents to\n"
+            "their auto-evaluation state. Manual accept/reject toggles on\n"
+            "other cells are preserved. Asks for confirmation."
+        )
+        rg.addWidget(self.reset_merges_btn)
+        return self.reset_group
 
     def build_deconv_panel(self) -> QWidget:
         """Return the deconvolution controls widget for placement in the center tab."""
@@ -139,26 +174,16 @@ class ParamsPanel(QWidget):
             self._rej_spins[key] = spin
         v.addWidget(self.reject_group)
 
-        # Evaluate + reset-manual buttons
-        btn_row = QHBoxLayout()
+        # Evaluate button (stays with the eval cutoffs).
+        eval_row = QHBoxLayout()
         self.evaluate_btn = QPushButton("Evaluate All")
         self.evaluate_btn.setEnabled(False)
         self.evaluate_btn.setToolTip(
             "Re-run automatic evaluation with the current settings.\n"
             "Cells that were manually accepted/rejected are preserved."
         )
-        btn_row.addWidget(self.evaluate_btn)
-
-        self.reset_manual_btn = QPushButton("Reset manual edits")
-        self.reset_manual_btn.setEnabled(False)
-        self.reset_manual_btn.setToolTip(
-            "Clear every manual accept/reject and revert all cells to their\n"
-            "last automatic-evaluation state (proc.accepted_core).\n"
-            "Asks for confirmation — this can't be undone."
-        )
-        btn_row.addWidget(self.reset_manual_btn)
-        v.addLayout(btn_row)
-        v.addStretch()
+        eval_row.addWidget(self.evaluate_btn)
+        v.addLayout(eval_row)
 
         self.eval_method_combo.currentIndexChanged.connect(self._on_method_changed)
         return w
@@ -342,14 +367,17 @@ class ParamsPanel(QWidget):
 
     def _connect_session(self) -> None:
         self.session.add_listener("data_loaded", self._on_data_loaded)
+        self.session.add_listener("cells_reevaluated", self._sync_reset_buttons)
         self.evaluate_btn.clicked.connect(self._on_evaluate)
         self.reset_manual_btn.clicked.connect(self._on_reset_manual)
+        self.reset_merges_btn.clicked.connect(self._on_reset_merges)
         self.run_foopsi_btn.clicked.connect(self._on_run_foopsi)
 
     def _on_data_loaded(self) -> None:
         self.evaluate_btn.setEnabled(True)
         self.reset_manual_btn.setEnabled(True)
         self.run_foopsi_btn.setEnabled(True)
+        self._sync_reset_buttons()
         # Seed CaImAn thresholds from the values stored in the file
         ep = self.session.est.eval_params_caiman or {}
         ec = self.session.ops.eval_caiman
@@ -427,9 +455,9 @@ class ParamsPanel(QWidget):
     def sync_to_ops(self) -> None:
         """Write all current control values into session.ops.
 
-        NOTE: When adding new Ops / sub-param fields, add the corresponding
-        read here (and the counterpart write in load_ops) so the values are
-        persisted across sessions.
+        Maps each widget to its specific ops field — intrinsically per-widget,
+        not driven by a registry. QSettings / HDF5 round-trip is registry-driven
+        (see OPS_SUB_PREFIXES in core/state) and picks up new fields for free.
         """
         ops = self.session.ops
         ec  = ops.eval_caiman
@@ -507,7 +535,9 @@ class ParamsPanel(QWidget):
         `accepted_core` has been computed yet), then emits cells_reevaluated.
         """
         from PyQt5.QtWidgets import QMessageBox
+        import numpy as np
         proc = self.session.proc
+        est  = self.session.est
         if proc is None or proc.manual_override is None:
             return
         n_manual = int(proc.manual_override.sum())
@@ -515,17 +545,37 @@ class ParamsPanel(QWidget):
             QMessageBox.information(self, "Reset manual edits",
                                     "There are no manual accept/reject edits to reset.")
             return
+
+        # Count merged cells (those added past the original CaImAn count) so
+        # the user knows they'll also be reverted — merges are recorded as
+        # manual additions under our core/manual separation. A dedicated
+        # "Reset merges" affordance is planned separately for fine-grained
+        # control; today this button reverts everything manual.
+        n_merges = 0
+        if est is not None:
+            n_total = int(proc.num_cells)
+            n_orig  = int(est.num_cells_original or n_total)
+            n_merges = max(0, n_total - n_orig)
+
+        merge_note = ""
+        if n_merges:
+            merge_note = (
+                f"\n\nNote: this will also drop {n_merges} merged cell"
+                f"{'s' if n_merges != 1 else ''} you created — merges count "
+                "as manual additions. Use 'Reset merges' to undo only merges."
+            )
+
         reply = QMessageBox.question(
             self, "Reset manual edits",
             f"Reset {n_manual} manually-edited cell{'s' if n_manual != 1 else ''} "
-            "back to the last automatic-evaluation state?\n\nThis cannot be undone.",
+            "back to the last automatic-evaluation state?"
+            f"{merge_note}\n\nThis cannot be undone.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        import numpy as np
         proc.manual_override[:] = False
         if proc.accepted_core is not None:
             proc.accepted = np.asarray(proc.accepted_core, dtype=bool).copy()
@@ -536,6 +586,48 @@ class ParamsPanel(QWidget):
             core_mask = evaluate_components(self.session.est, proc, self.session.ops)
             update_accepted(proc, core_mask)
         self.session.reevaluate_all()
+
+    def _on_reset_merges(self) -> None:
+        """Undo every recorded merge in this session.
+
+        Drops all merged-in cells (those at index >= est.num_cells_original)
+        and restores each merge's parents to their auto-eval state. Manual
+        accept/reject toggles on other cells are preserved.
+        """
+        from PyQt5.QtWidgets import QMessageBox
+        from caiman_sorter_py.core.merge import reset_all_merges
+        proc = self.session.proc
+        est  = self.session.est
+        if proc is None or est is None:
+            return
+        n_merges = len(proc.merge_parents) if proc.merge_parents else 0
+        if n_merges == 0:
+            QMessageBox.information(self, "Reset merges",
+                                    "There are no merges to undo.")
+            return
+        reply = QMessageBox.question(
+            self, "Reset merges",
+            f"Undo {n_merges} merge{'s' if n_merges != 1 else ''}?\n\n"
+            "All merged-in cells will be dropped and their parent cells "
+            "restored to the last automatic-evaluation state.\n\n"
+            "This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        reset_all_merges(est, proc)
+        # If the selected cell index no longer exists, point at cell 0.
+        if self.session.current_cell >= proc.num_cells:
+            self.session.current_cell = 0
+        self.session.reevaluate_all()
+
+    def _sync_reset_buttons(self) -> None:
+        """Enable/disable Reset merges based on whether any merges exist."""
+        proc = self.session.proc
+        has_merges = bool(proc and proc.merge_parents)
+        if hasattr(self, "reset_merges_btn"):
+            self.reset_merges_btn.setEnabled(has_merges)
 
     def _cells_to_process(self) -> "np.ndarray":
         """Return cell indices to deconvolve: current cell only, or all."""

@@ -41,6 +41,10 @@ class NavPanel(QWidget):
         super().__init__(parent)
         self.session = session
         self._metric_labels: dict[str, QLabel] = {}
+        # Lazy per-cell footprint cache so rapid arrow-stepping doesn't re-
+        # materialise the same 65k-pixel dense column over and over.
+        from caiman_sorter_py.core.footprint import FootprintCache
+        self._footprint_cache = FootprintCache(maxsize=200)
         self._build_ui()
         self._connect_session()
 
@@ -197,6 +201,7 @@ class NavPanel(QWidget):
             lambda: self.session.set_accepted(self.session.current_cell, False))
 
     def _on_data_loaded(self) -> None:
+        self._footprint_cache.clear()
         n = self.session.proc.num_cells
         self.cell_spinner.setMaximum(n - 1)
         self.total_label.setText(f"/ {n}")
@@ -219,7 +224,13 @@ class NavPanel(QWidget):
     # ------------------------------------------------------------------
 
     def update_counts(self) -> None:
-        """Refresh accepted/rejected count in the navigation group box title."""
+        """Refresh accepted/rejected count + spinner max in the nav group box.
+
+        n_cells may change between calls (merge appends cells, reset truncates),
+        so re-sync the spinner max and the footprint cache here. Without this
+        the spinner can't navigate to newly-merged cells, and the cache may
+        hold post-reset stale entries that would IndexError on lookup.
+        """
         if self.session.proc is None:
             return
         n_acc = int(self.session.proc.accepted.sum())
@@ -227,6 +238,14 @@ class NavPanel(QWidget):
         self.nav_group.setTitle(
             f"Cell Navigation  —  {n_acc} accepted / {n_tot - n_acc} rejected"
         )
+        # Re-sync spinner range and drop the per-cell footprint cache.
+        self.cell_spinner.blockSignals(True)
+        self.cell_spinner.setMaximum(max(0, n_tot - 1))
+        if self.cell_spinner.value() >= n_tot:
+            self.cell_spinner.setValue(max(0, n_tot - 1))
+        self.cell_spinner.blockSignals(False)
+        self.total_label.setText(f"/ {n_tot}")
+        self._footprint_cache.clear()
 
     def update_cell_info(self, cell_idx: int) -> None:
         """Refresh metric labels and component image for the given cell."""
@@ -275,9 +294,11 @@ class NavPanel(QWidget):
             "background-color: #c62828; color: white;"
         )
 
-        # Component spatial footprint image — zoomed to bounding box
+        # Component spatial footprint image — zoomed to bounding box.
+        # Cache the dense (h, w) reshape so rapid arrow-stepping doesn't
+        # re-materialise the same 65k-pixel column from sparse A on every step.
         dims = est.dims   # (height, width)
-        footprint = est.A[:, cell_idx].toarray().reshape(dims, order="F")
+        footprint = self._footprint_cache.get(est, cell_idx)
 
         nz_rows, nz_cols = np.where(footprint > 0)
         if len(nz_rows) > 0:

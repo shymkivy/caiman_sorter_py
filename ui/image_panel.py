@@ -44,7 +44,11 @@ class ImagePanel(QWidget):
         self._acc_wcomp_signed = None    # (h, w) A[:, accepted] @ mean(C)[accepted]
         self._rej_wcomp_signed = None    # (h, w) A[:, rejected] @ mean(C)[rejected]
         # Lazy per-cell footprint cache (dense (h, w) — only built for toggled cells)
-        self._footprint_cache: dict[int, "np.ndarray"] = {}
+        from caiman_sorter_py.core.footprint import FootprintCache
+        self._footprint_cache = FootprintCache(maxsize=200)
+        # CSR view of est.A — built once after data load for O(nnz_row) row slices
+        # in _on_click. CSC row slicing (est.A.getrow) is O(nnz), CSR is O(nnz_row).
+        self._A_csr = None
         self._build_ui()
         self._connect_session()
 
@@ -212,12 +216,21 @@ class ImagePanel(QWidget):
         self._acc_wcomp_signed = None
         self._rej_wcomp_signed = None
         self._footprint_cache.clear()
+        self._A_csr            = None
         self.refresh_images()
 
     def refresh_images(self) -> None:
         """Rebuild both composite images from scratch."""
         if self.session.est is None:
             return
+        # n_cells can change between refreshes (merge appends cells, reset
+        # truncates) — drop the CSR shadow of est.A AND the per-cell footprint
+        # cache so the next click/lookup rebuilds against the current A.
+        # Without this, _on_click uses a stale-shape CSR and silently misses
+        # newly-added merged cells; the footprint cache can hold post-reset
+        # entries past num_cells_original that would IndexError on lookup.
+        self._A_csr = None
+        self._footprint_cache.clear()
         self._ensure_bkg_cache()
         self._clear_axes()
         self._draw_backgrounds()
@@ -394,14 +407,7 @@ class ImagePanel(QWidget):
 
     def _footprint_for(self, cell_idx: int) -> np.ndarray:
         """Return cell_idx's spatial footprint as a dense (h, w) array, cached."""
-        fp = self._footprint_cache.get(cell_idx)
-        if fp is None:
-            est = self.session.est
-            fp = np.asarray(est.A[:, cell_idx].toarray()).ravel().reshape(
-                est.dims, order="F"
-            )
-            self._footprint_cache[cell_idx] = fp
-        return fp
+        return self._footprint_cache.get(self.session.est, cell_idx)
 
     @staticmethod
     def _compute_bg_component_image(est) -> np.ndarray | None:
@@ -598,9 +604,6 @@ class ImagePanel(QWidget):
             self._canvas_splitter.setMaximumHeight(target_h)
             self._canvas_splitter.setMinimumHeight(max(100, target_h - 8))
 
-    def _on_pick(self, event) -> None:
-        pass
-
     def _on_click(self, event) -> None:
         """Select or toggle the cell at the clicked pixel.
 
@@ -636,11 +639,16 @@ class ImagePanel(QWidget):
             return
 
         linear_px = row + col * height
-        A_row     = np.asarray(est.A.getrow(linear_px).todense()).ravel()
-        pix_vals  = A_row[candidates]
-
-        if len(pix_vals) > 0 and pix_vals.max() > 0:
-            best = int(candidates[int(np.argmax(pix_vals))])
+        # Use the cached CSR view for O(nnz_in_row) row slicing instead of CSC's
+        # O(total_nnz) getrow + dense materialisation.
+        if self._A_csr is None:
+            self._A_csr = est.A.tocsr()
+        row_sparse = self._A_csr.getrow(linear_px)
+        nz_cols    = row_sparse.indices
+        nz_vals    = row_sparse.data
+        mask       = np.isin(nz_cols, candidates)
+        if mask.any():
+            best = int(nz_cols[mask][int(np.argmax(nz_vals[mask]))])
         else:
             best = self._nearest_com(candidates, row, col)
 

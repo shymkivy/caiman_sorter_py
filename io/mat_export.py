@@ -168,6 +168,15 @@ def _build_proc(proc, n_cells: int, n_frames: int) -> dict:
         "peak_bin_zero_size":   5.0,
     }
 
+    # Merge history: list of (parent_a, parent_b) tuples → (n_merges, 2)
+    # int32 array with 1-based indices for MATLAB consumers.
+    mp = getattr(proc, "merge_parents", None) or []
+    if mp:
+        arr = np.asarray(mp, dtype=np.int32).reshape(-1, 2) + 1
+    else:
+        arr = np.zeros((0, 2), dtype=np.int32)
+    out["merge_parents"] = arr
+
     # Per-cell scalar metrics — column vectors (n_cells, 1) in MATLAB
     for name in ("noise", "skewness", "peaks_ave", "num_zeros",
                  "SNR2_vals", "firing_stab_vals",
@@ -351,7 +360,7 @@ def _build_ops(ops, source_path: str) -> dict:
         "eval_params_caiman":   eval_params_caiman,
         "eval_params2":         eval_params2,
         "deconv":               deconv,
-        "mat_file_loc":         str(source_path or ""),
+        "mat_file_loc":         _strip_nul(str(source_path or "")),
     }
     return out_ops
 
@@ -432,11 +441,25 @@ def _rename_eval_keys(d: dict) -> dict:
     return {_EVAL_KEY_RENAMES.get(k, k): v for k, v in (d or {}).items()}
 
 
+def _strip_nul(s):
+    """Drop embedded NUL bytes from a string. Mirrors io.session._clean_str —
+    h5py vlen strings (used by hdf5storage for str fields) reject embedded NULs.
+    """
+    if isinstance(s, (bytes, np.bytes_)):
+        s = s.decode(errors="replace")
+    if isinstance(s, str):
+        return s.replace("\x00", "")
+    return s
+
+
 def _flatten_dict_to_scalars(d: dict) -> dict:
     """Recursively normalise a dict so values are scalars / arrays / nested dicts.
 
     Used for init_params_caiman / eval_params_caiman which may contain Python
     Nones, tuples, etc. We coerce types so hdf5storage can write them.
+    String values get their embedded NULs stripped — without this, fixed-length
+    byte-string params loaded from CaImAn (`|S32` with trailing NUL padding)
+    crash hdf5storage's vlen-string writer.
     """
     out: dict = {}
     for k, v in (d or {}).items():
@@ -447,15 +470,21 @@ def _flatten_dict_to_scalars(d: dict) -> dict:
             out[k] = _flatten_dict_to_scalars(v)
         elif isinstance(v, (list, tuple)):
             try:
-                out[k] = np.asarray(v)
+                arr = np.asarray(v)
+                if arr.dtype.kind in ("U", "S", "O"):
+                    out[k] = np.asarray([_strip_nul(x) for x in v])
+                else:
+                    out[k] = arr
             except Exception:
-                out[k] = str(v)
+                out[k] = _strip_nul(str(v))
         elif isinstance(v, bool):
             out[k] = bool(v)
-        elif isinstance(v, (int, float, str)):
+        elif isinstance(v, str):
+            out[k] = _strip_nul(v)
+        elif isinstance(v, (int, float)):
             out[k] = v
         elif isinstance(v, np.ndarray):
             out[k] = v
         else:
-            out[k] = str(v)
+            out[k] = _strip_nul(str(v))
     return out

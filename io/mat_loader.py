@@ -104,40 +104,22 @@ def _read_est(g: h5py.Group) -> Estimates:
     n_cells = (A.shape[1] if A is not None
                else (C.shape[0] if C is not None else 0))
 
-    # Recompute contours from A
-    contours = None
-    if A is not None and dims and dims[0] > 0:
-        try:
-            from caiman_sorter_py.core.contours import compute_contours
-            contours = compute_contours(A, dims, thr=0.01)
-        except Exception:
-            contours = None
+    # If A is missing, fabricate an empty sparse matrix so the factory has a
+    # consistent dims-aware backing for default-zero arrays.
+    if A is None:
+        A = csc_matrix((dims[0] * dims[1] if dims else 0, n_cells))
 
-    num_orig = _read_scalar(g, "num_cells_original")
-    if num_orig is None:
-        num_orig = n_cells
-
-    return Estimates(
-        A=A if A is not None else csc_matrix((dims[0] * dims[1] if dims else 0, n_cells)),
-        C=C if C is not None else np.zeros((n_cells, 0)),
-        YrA=YrA if YrA is not None else np.zeros((n_cells, 0)),
-        S=S if S is not None else np.zeros((n_cells, 0)),
-        F_dff=F_dff if F_dff is not None else np.zeros((n_cells, 0)),
-        SNR_comp=SNR_comp if SNR_comp is not None else np.zeros(n_cells),
-        cnn_preds=cnn_preds if cnn_preds is not None else np.zeros(n_cells, dtype=np.float32),
-        r_values=r_values if r_values is not None else np.zeros(n_cells),
-        g=g_arr if g_arr is not None else np.zeros((1, n_cells)),
-        dims=dims,
+    return Estimates.from_arrays(
+        A=A, dims=dims,
+        C=C, YrA=YrA, S=S, F_dff=F_dff,
+        SNR_comp=SNR_comp, cnn_preds=cnn_preds, r_values=r_values,
+        g=g_arr,
         idx_components=idx_comp,
         idx_components_bad=idx_bad,
-        contours=contours,
-        sn=sn,
-        b=bb,
-        f=bg_f,
-        neurons_sn=neurons_sn,
-        eval_params_caiman=eval_params or None,
-        init_params_caiman=init_params or None,
-        num_cells_original=int(num_orig),
+        sn=sn, b=bb, f=bg_f, neurons_sn=neurons_sn,
+        eval_params_caiman=eval_params,
+        init_params_caiman=init_params,
+        num_cells_original=_read_scalar(g, "num_cells_original"),
     )
 
 
@@ -199,6 +181,17 @@ def _read_proc(g: h5py.Group, est: Estimates) -> Proc:
         if "c_foopsi" in deconv:
             fp = deconv["c_foopsi"]
             proc.foopsi = _read_foopsi_cells(fp, n_cells)
+
+    # Merge history (n_merges, 2) int32 1-based MATLAB indices → list of
+    # 0-based (parent_a, parent_b) tuples. Absent on legacy .mat files.
+    mp = _read_2d(g, "merge_parents")
+    if mp is not None:
+        arr = np.asarray(mp, dtype=np.int64)
+        if arr.size and arr.ndim == 2 and arr.shape[1] == 2:
+            arr = arr - 1
+            proc.merge_parents = [
+                (int(a), int(b)) for a, b in arr if a >= 0 and b >= 0
+            ]
 
     return proc
 
@@ -514,11 +507,3 @@ def _rename_eval_keys_inverse(d: dict) -> dict:
     }
     return {rev.get(k, k): v for k, v in (d or {}).items()}
 
-
-# ----------------------------------------------------------------------
-# Legacy alias kept for backwards-compatibility with any earlier imports
-# ----------------------------------------------------------------------
-
-def load_matlab_session(path: str | Path):
-    """Alias for load_session_mat — name used historically."""
-    return load_session_mat(path)

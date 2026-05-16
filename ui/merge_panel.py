@@ -36,6 +36,9 @@ class _MergePreviewDialog(QDialog):
         self.setWindowTitle(f"Merge preview — cells {a} and {b}")
         self.setMinimumSize(900, 640)
         self.setModal(False)              # let user interact with main window
+        # Free the dialog (and its big matplotlib Figure) when closed instead
+        # of keeping it alive via parent + finished-signal lambda capture.
+        self.setAttribute(Qt.WA_DeleteOnClose)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)

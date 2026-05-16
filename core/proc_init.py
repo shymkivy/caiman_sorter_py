@@ -12,6 +12,51 @@ from scipy.linalg import toeplitz
 from scipy.stats import skew
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers used by initialize_proc and merge._metrics_for_new_cell
+# (kept module-level so both flows resolve fr/ar_order/fudge_factor/lags from
+# est.init_params_caiman the same way, and compute the AR(1)+AR(p)+tau pair
+# identically).
+# ---------------------------------------------------------------------------
+
+def get_ar_init_params(est) -> tuple[float, float, int, float, int]:
+    """Resolve (fr, dt, ar_order, fudge_factor, lags) from est.init_params_caiman.
+
+    All four params are looked up with sensible defaults — defaults match
+    `f_cs_initialize_new_proc.m` and CaImAn's `params/init`.
+    """
+    from caiman_sorter_py.core.state import get_init_param
+    init = est.init_params_caiman
+    fr           = float(get_init_param(init, "fr",           30))
+    ar_order     = int(  get_init_param(init, "ar_order",     2))
+    fudge_factor = float(get_init_param(init, "fudge_factor", 0.99))
+    lags         = int(  get_init_param(init, "lags",         5))
+    return fr, 1.0 / fr, ar_order, fudge_factor, lags
+
+
+def compute_ar_pair(noise_val: float, acf_row: np.ndarray,
+                    ar_order: int, lags: int, fudge_factor: float, dt: float
+                    ) -> tuple[float, np.ndarray, float, np.ndarray]:
+    """Compute the AR(1) and AR(ar_order) coefficients + taus for one cell.
+
+    Mirrors the per-cell body of `initialize_proc`'s main loop. Returns
+    `(gAR1, gAR2, tauAR1, tauAR2)` where the AR(2) outputs are padded to
+    length 2 (gAR2 = [g1, 0] for AR(1) order, tauAR2 = [0, tau_decay] etc).
+    """
+    g1 = estimate_ar_coefficients(1, noise_val, acf_row,
+                                  lags=lags, fudge_factor=fudge_factor)
+    gAR1 = float(g1[0])
+    tau1 = ar_to_tau(g1, dt)
+    tauAR1 = float(tau1[-1])
+
+    g2 = estimate_ar_coefficients(ar_order, noise_val, acf_row,
+                                  lags=lags, fudge_factor=fudge_factor)
+    gAR2  = g2[:2] if len(g2) >= 2 else np.array([g2[0], 0.0])
+    tau2  = ar_to_tau(g2, dt)
+    tauAR2 = tau2[:2] if len(tau2) >= 2 else np.array([0.0, tau2[0]])
+    return gAR1, np.asarray(gAR2, dtype=float), tauAR1, np.asarray(tauAR2, dtype=float)
+
+
 def init_proc_minimal(est) -> "Proc":
     """Create a Proc with acceptance masks and noise set, no heavy computation.
 
@@ -58,13 +103,7 @@ def initialize_proc(est, ops, log_cb=None) -> "Proc":
         if log_cb:
             log_cb(msg)
 
-    from caiman_sorter_py.core.state import get_init_param
-    init = est.init_params_caiman
-    fr           = float(get_init_param(init, "fr", 30))
-    dt           = 1.0 / fr
-    ar_order     = int(get_init_param(init, "ar_order", 2))
-    fudge_factor = float(get_init_param(init, "fudge_factor", 0.99))
-    lags         = int(get_init_param(init, "lags", 5))
+    fr, dt, ar_order, fudge_factor, lags = get_ar_init_params(est)
 
     n_cells, n_frames = est.C.shape
     traces = est.C + est.YrA   # raw fluorescence (n_cells × n_frames)
@@ -101,17 +140,9 @@ def initialize_proc(est, ops, log_cb=None) -> "Proc":
     batch_acf  = _batch_autocov(traces, total_lags)   # (n_cells, total_lags+1)
 
     for i in range(n_cells):
-        g1 = estimate_ar_coefficients(1, noise[i], batch_acf[i],
-                                      lags=lags, fudge_factor=fudge_factor)
-        gAR1[i] = g1[0]
-        tau1 = ar_to_tau(g1, dt)
-        tauAR1[i] = tau1[-1]
-
-        g2 = estimate_ar_coefficients(ar_order, noise[i], batch_acf[i],
-                                      lags=lags, fudge_factor=fudge_factor)
-        gAR2[i] = g2[:2] if len(g2) >= 2 else np.array([g2[0], 0.0])
-        tau2 = ar_to_tau(g2, dt)
-        tauAR2[i] = tau2[:2] if len(tau2) >= 2 else np.array([0.0, tau2[0]])
+        gAR1[i], gAR2[i], tauAR1[i], tauAR2[i] = compute_ar_pair(
+            noise[i], batch_acf[i], ar_order, lags, fudge_factor, dt,
+        )
 
     # --- firing stability ---
     _log("Computing firing stability...")

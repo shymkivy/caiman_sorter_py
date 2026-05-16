@@ -9,7 +9,7 @@ File detection via root attribute /format ∈ { 'caiman_sorter_session', 'caiman
 """
 from __future__ import annotations
 
-from dataclasses import fields, is_dataclass
+from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -20,8 +20,7 @@ from scipy.sparse import csc_matrix
 
 from caiman_sorter_py import __version__
 from caiman_sorter_py.core.state import (
-    DeconvParams, DeconvResults, Estimates, EvalParamsCaiman,
-    EvalParamsReject, MergeParams, Ops, Proc, SmoothDfdtParams, SpikesParams,
+    DeconvResults, Estimates, OPS_SUB_PREFIXES, Ops, Proc,
 )
 
 FORMAT_SESSION = "caiman_sorter_session"
@@ -40,7 +39,7 @@ def save_session(path: str | Path, est: Estimates, proc: Proc, ops: Ops,
         f.attrs["format"]      = FORMAT_SESSION
         f.attrs["app_version"] = __version__
         f.attrs["saved_at"]    = datetime.now().isoformat(timespec="seconds")
-        f.attrs["source_path"] = str(source_path)
+        f.attrs["source_path"] = _clean_str(str(source_path))
 
         _write_init_params(f.create_group("init_params_caiman"),
                            est.init_params_caiman or {})
@@ -160,21 +159,8 @@ def _read_est(g: h5py.Group, init_params: dict, eval_params: dict) -> Estimates:
     )
     dims = tuple(int(x) for x in g["dims"][:])
 
-    nsn = np.asarray(g["neurons_sn"][:]) if "neurons_sn" in g else None
-    sn  = np.asarray(g["sn"][:]) if "sn" in g else None
-    bb  = np.asarray(g["b"][:])  if "b"  in g else None
-    bg_f = np.asarray(g["f"][:]) if "f"  in g else None
-
-    # Recompute contours from A using the threshold stored in ops (or default 0.01).
-    contours = None
-    try:
-        from caiman_sorter_py.core.contours import compute_contours
-        contours = compute_contours(A, dims, thr=0.01)
-    except Exception:
-        pass
-
-    return Estimates(
-        A=A,
+    return Estimates.from_arrays(
+        A=A, dims=dims,
         C=np.asarray(g["C"][:]),
         YrA=np.asarray(g["YrA"][:]),
         S=np.asarray(g["S"][:]),
@@ -183,16 +169,14 @@ def _read_est(g: h5py.Group, init_params: dict, eval_params: dict) -> Estimates:
         cnn_preds=np.asarray(g["cnn_preds"][:]),
         r_values=np.asarray(g["r_values"][:]),
         g=np.asarray(g["g"][:]),
-        dims=dims,
         idx_components=np.asarray(g["idx_components"][:]),
         idx_components_bad=np.asarray(g["idx_components_bad"][:]),
-        contours=contours,
-        sn=sn,
-        b=bb,
-        f=bg_f,
-        neurons_sn=nsn,
-        eval_params_caiman=eval_params or None,
-        init_params_caiman=init_params or None,
+        neurons_sn=np.asarray(g["neurons_sn"][:]) if "neurons_sn" in g else None,
+        sn=np.asarray(g["sn"][:])                 if "sn"         in g else None,
+        b=np.asarray(g["b"][:])                   if "b"          in g else None,
+        f=np.asarray(g["f"][:])                   if "f"          in g else None,
+        eval_params_caiman=eval_params,
+        init_params_caiman=init_params,
         num_cells_original=int(g.attrs.get("num_cells_original", A.shape[1])),
     )
 
@@ -219,6 +203,15 @@ def _write_proc(g: h5py.Group, proc: Proc) -> None:
     _write_deconv(g.create_group("foopsi"), proc.foopsi,
                   proc.num_cells, proc.num_frames)
 
+    # Merge history (drives "Reset merges" undo across save/reload). Stored
+    # as (n_merges, 2) int64 of (parent_a, parent_b). Skip the dataset when
+    # the list is empty so old readers don't see an unexpected key.
+    if proc.merge_parents:
+        g.create_dataset(
+            "merge_parents",
+            data=np.asarray(proc.merge_parents, dtype=np.int64),
+        )
+
 
 def _read_proc(g: h5py.Group, n_cells: int, n_frames: int) -> Proc:
     proc = Proc(
@@ -237,44 +230,64 @@ def _read_proc(g: h5py.Group, n_cells: int, n_frames: int) -> Proc:
         proc.smooth_dfdt = _read_deconv(g["smooth_dfdt"], n_cells, n_frames)
     if "foopsi" in g:
         proc.foopsi      = _read_deconv(g["foopsi"], n_cells, n_frames)
+
+    # Merge history (absent on legacy saves — leaves the dataclass default
+    # empty list in place).
+    if "merge_parents" in g:
+        arr = np.asarray(g["merge_parents"][:], dtype=np.int64)
+        if arr.size:
+            proc.merge_parents = [(int(a), int(b)) for a, b in arr.reshape(-1, 2)]
     return proc
 
 
 def _write_deconv(g: h5py.Group, dr: DeconvResults,
                   n_cells: int, n_frames: int) -> None:
-    """Store per-cell DeconvResults as dense arrays + a `done` mask.
+    """Store per-cell DeconvResults packed to only the populated cells.
 
-    S and C are (n_cells, n_frames) float64, with zeros where the cell hasn't
-    been processed. `done` is a (n_cells,) bool mask of which cells have data.
-    g is variable-length: stored as (n_cells, max_p) padded with NaN.
+    For a session with k of n_cells run, this writes:
+      `idx`  (k,)            int32      cell indices that have data
+      `S`    (k, n_frames)   float64    deconvolved spikes
+      `C`    (k, n_frames)   float64    denoised calcium
+      `g`    (k, max_p)      float64    AR coeffs, NaN-padded
+      `done` (n_cells,)      bool       full mask (kept for back-compat readers)
+    Packing avoids the (n_cells, n_frames) transient float64 buffer when only
+    a handful of cells have been processed.
     """
-    done = np.zeros(n_cells, dtype=bool)
-    S_arr = np.zeros((n_cells, n_frames), dtype=np.float64)
-    C_arr = np.zeros((n_cells, n_frames), dtype=np.float64)
-
+    # Collect populated cell indices + sizes in one pass.
+    idx_list: list[int] = []
     max_p = 0
-    for i in range(min(n_cells, len(dr.g))):
-        gi = dr.g[i]
-        if gi is not None:
-            max_p = max(max_p, int(np.asarray(gi).size))
-
-    g_arr = np.full((n_cells, max(max_p, 1)), np.nan, dtype=np.float64)
-
     for i in range(n_cells):
         s = dr.S[i] if i < len(dr.S) else None
         c = dr.C[i] if i < len(dr.C) else None
         gi = dr.g[i] if i < len(dr.g) else None
         if s is None and c is None and gi is None:
             continue
-        done[i] = True
+        idx_list.append(i)
+        if gi is not None:
+            max_p = max(max_p, int(np.asarray(gi).size))
+
+    k = len(idx_list)
+    done = np.zeros(n_cells, dtype=bool)
+    idx_arr = np.asarray(idx_list, dtype=np.int32)
+    done[idx_arr] = True
+
+    S_arr = np.zeros((k, n_frames), dtype=np.float64)
+    C_arr = np.zeros((k, n_frames), dtype=np.float64)
+    g_arr = np.full((k, max(max_p, 1)), np.nan, dtype=np.float64)
+
+    for row, i in enumerate(idx_list):
+        s = dr.S[i] if i < len(dr.S) else None
+        c = dr.C[i] if i < len(dr.C) else None
+        gi = dr.g[i] if i < len(dr.g) else None
         if s is not None:
-            S_arr[i, :len(s)] = np.asarray(s, dtype=np.float64)
+            S_arr[row, :len(s)] = np.asarray(s, dtype=np.float64)
         if c is not None:
-            C_arr[i, :len(c)] = np.asarray(c, dtype=np.float64)
+            C_arr[row, :len(c)] = np.asarray(c, dtype=np.float64)
         if gi is not None:
             gi_arr = np.asarray(gi, dtype=np.float64).flatten()
-            g_arr[i, :gi_arr.size] = gi_arr
+            g_arr[row, :gi_arr.size] = gi_arr
 
+    g.create_dataset("idx",  data=idx_arr)
     g.create_dataset("S",    data=S_arr, compression="gzip", chunks=True)
     g.create_dataset("C",    data=C_arr, compression="gzip", chunks=True)
     g.create_dataset("g",    data=g_arr)
@@ -292,6 +305,25 @@ def _read_deconv(g: h5py.Group, n_cells: int, n_frames: int) -> DeconvResults:
         C=[None] * n_cells,
         g=[None] * n_cells,
     )
+
+    if "idx" in g:
+        # Packed format: S/C/g are (k, n_frames), idx maps row → cell.
+        idx_arr = np.asarray(g["idx"][:], dtype=np.int64)
+        for row, i in enumerate(idx_arr):
+            i = int(i)
+            if i < 0 or i >= n_cells:
+                continue
+            if S is not None:
+                dr.S[i] = S[row].copy()
+            if C is not None:
+                dr.C[i] = C[row].copy()
+            if G is not None:
+                gr = G[row]
+                valid = gr[~np.isnan(gr)]
+                dr.g[i] = valid if valid.size else None
+        return dr
+
+    # Legacy dense format: S/C/g are (n_cells, ...) indexed by cell id.
     for i in range(n_cells):
         if not done[i]:
             continue
@@ -310,25 +342,17 @@ def _read_deconv(g: h5py.Group, n_cells: int, n_frames: int) -> DeconvResults:
 # Ops
 # ----------------------------------------------------------------------
 
-# Sub-dataclasses to round-trip as nested groups in /ops/.
-_OPS_SUBGROUPS = {
-    "eval_caiman": EvalParamsCaiman,
-    "eval_reject": EvalParamsReject,
-    "spikes":      SpikesParams,
-    "smooth_dfdt": SmoothDfdtParams,
-    "foopsi":      DeconvParams,
-    "merge":       MergeParams,
-}
-
-
 def _write_ops(g: h5py.Group, ops: Ops) -> None:
-    # Scalar fields at the top of /ops
+    # Top-level scalar fields stored on the /ops group's attrs. (Not the full
+    # OPS_TOP_FIELD_NAMES list — save_tag / save_as_mat are per-user prefs and
+    # deliberately not embedded in the session file.)
     g.attrs["eval_method"]          = str(ops.eval_method)
     g.attrs["load_caiman_rejected"] = bool(ops.load_caiman_rejected)
     g.attrs["contour_thr"]          = float(ops.contour_thr)
 
-    # Sub-dataclasses → nested groups
-    for name, _cls in _OPS_SUBGROUPS.items():
+    # Sub-dataclasses → nested groups. Iteration driven by the shared
+    # OPS_SUB_PREFIXES registry in core/state.
+    for name in OPS_SUB_PREFIXES:
         sub = getattr(ops, name)
         sg  = g.create_group(name)
         for fld in fields(sub):
@@ -352,7 +376,7 @@ def _read_ops(g: h5py.Group) -> Ops:
     if "contour_thr" in g.attrs:
         ops.contour_thr = float(g.attrs["contour_thr"])
 
-    for name, cls in _OPS_SUBGROUPS.items():
+    for name in OPS_SUB_PREFIXES:
         if name not in g:
             continue
         sg = g[name]
@@ -380,6 +404,21 @@ def _is_scalar(v) -> bool:
     return isinstance(v, (bool, int, float, str, np.bool_, np.integer, np.floating))
 
 
+def _clean_str(s) -> str:
+    """Drop embedded NUL bytes from a string-like value.
+
+    CaImAn HDF5 files store some params as fixed-length `|S32` byte strings,
+    which leave trailing NULs after decode (`"2\\x00\\x00..."`). h5py's
+    variable-length string type rejects embedded NULs on write — round-trip
+    would crash with 'vlen strings do not support embedded nulls'.
+    """
+    if isinstance(s, (bytes, np.bytes_)):
+        s = s.decode(errors="replace")
+    if isinstance(s, str):
+        return s.replace("\x00", "")
+    return s
+
+
 def _write_init_params(g: h5py.Group, params: dict) -> None:
     """Recursively write a nested dict of scalars/arrays to an HDF5 group."""
     for k, v in (params or {}).items():
@@ -389,38 +428,43 @@ def _write_init_params(g: h5py.Group, params: dict) -> None:
         elif v is None:
             g.attrs[k] = "NoneType"
         elif _is_scalar(v):
+            if isinstance(v, (bytes, np.bytes_, str)):
+                v = _clean_str(v)
             try:
                 g.attrs[k] = v
             except (TypeError, ValueError):
-                g.attrs[k] = str(v)
+                g.attrs[k] = _clean_str(str(v))
         elif isinstance(v, np.ndarray):
             try:
                 g.create_dataset(k, data=v)
             except (TypeError, ValueError):
-                g.attrs[k] = str(v)
+                g.attrs[k] = _clean_str(str(v))
         elif isinstance(v, (list, tuple)):
             try:
                 arr = np.asarray(v)
                 if arr.dtype.kind in ("U", "S", "O"):
-                    g.create_dataset(k, data=np.asarray(v, dtype=h5py.string_dtype()))
+                    # Strip NULs from any string elements before vlen write.
+                    cleaned = [_clean_str(x) for x in v]
+                    g.create_dataset(k, data=np.asarray(cleaned, dtype=h5py.string_dtype()))
                 else:
                     g.create_dataset(k, data=arr)
             except (TypeError, ValueError):
-                g.attrs[k] = str(v)
+                g.attrs[k] = _clean_str(str(v))
         else:
-            g.attrs[k] = str(v)
+            g.attrs[k] = _clean_str(str(v))
 
 
 def _read_init_params(g: h5py.Group) -> dict:
     out: dict = {}
     for k, v in g.attrs.items():
         if isinstance(v, (bytes, np.bytes_)):
-            s = v.decode(errors="replace")
+            s = _clean_str(v)
             out[str(k)] = None if s == "NoneType" else s
         elif isinstance(v, np.generic):
             out[str(k)] = v.item()
-        elif isinstance(v, str) and v == "NoneType":
-            out[str(k)] = None
+        elif isinstance(v, str):
+            s = _clean_str(v)
+            out[str(k)] = None if s == "NoneType" else s
         else:
             out[str(k)] = v
     for k in g.keys():
