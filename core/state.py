@@ -273,6 +273,20 @@ class SpikesParams:
 
 
 @dataclass
+class PlotParams:
+    """Display-only orientation of the spatial images.
+
+    GUI preference, NOT a data-file field. Persisted in QSettings only —
+    never written to `.h5` or `.mat` outputs. Applied at render time in
+    image_panel + nav_panel; underlying est.A / contours stay in their
+    original CaImAn coordinate system.
+    """
+    rotation: int = 0           # one of 0, 90, 180, 270 (CCW degrees)
+    flip_h: bool = False        # mirror left/right
+    flip_v: bool = False        # mirror top/bottom
+
+
+@dataclass
 class SmoothDfdtParams:
     """Parameters for the smooth dF/dt (Gaussian convolution) method."""
     gauss_sigma: float = 50.0            # ms
@@ -295,6 +309,7 @@ class Ops:
     smooth_dfdt: SmoothDfdtParams = field(default_factory=SmoothDfdtParams)
     foopsi: DeconvParams = field(default_factory=DeconvParams)
     merge: MergeParams = field(default_factory=MergeParams)
+    plot: PlotParams = field(default_factory=PlotParams)   # GUI-only; not written to data files
     load_caiman_rejected: bool = False   # include CaImAn-rejected components on load
     save_tag: str = "_sort"              # string appended to source stem in default save names
     save_as_mat: bool = False            # also write a MATLAB-compatible .mat alongside the .h5 save
@@ -310,7 +325,8 @@ class Ops:
 # serializer code (it shows up automatically via dataclasses.fields()).
 # --------------------------------------------------------------------------- #
 
-# Sub-dataclass attr on Ops → short key prefix used in QSettings / mat / etc.
+# Sub-dataclass attr on Ops → short key prefix used in QSettings AND data
+# file ops blocks (.h5 / .mat). Adding here writes the sub-block to disk.
 OPS_SUB_PREFIXES: dict[str, str] = {
     "eval_caiman": "ec",
     "eval_reject": "er",
@@ -318,6 +334,14 @@ OPS_SUB_PREFIXES: dict[str, str] = {
     "smooth_dfdt": "sd",
     "foopsi":      "fp",
     "merge":       "mg",
+}
+
+# Sub-dataclass attrs that round-trip through QSettings ONLY — i.e. GUI prefs
+# we deliberately keep out of saved data files. `_save_ops_settings` /
+# `_restore_ops_settings` iterate this in addition to `OPS_SUB_PREFIXES`,
+# while `_write_ops` / `_read_ops` only iterate `OPS_SUB_PREFIXES`.
+QSETTINGS_ONLY_SUBS: dict[str, str] = {
+    "plot": "pl",
 }
 
 # Top-level scalar attrs on Ops that should round-trip. Order doesn't matter.
@@ -353,6 +377,7 @@ class Session:
             "cell_accepted_changed": [],
             "cells_reevaluated": [],
             "data_loaded": [],
+            "plot_params_changed": [],
         }
 
     # ------------------------------------------------------------------
@@ -400,3 +425,7 @@ class Session:
     def refresh_cell(self) -> None:
         """Re-emit cell_selected for the current cell (e.g. after deconv param change)."""
         self._emit("cell_selected", self.current_cell)
+
+    def notify_plot_params_changed(self) -> None:
+        """Tell image / nav panels to re-render with the current ops.plot."""
+        self._emit("plot_params_changed")

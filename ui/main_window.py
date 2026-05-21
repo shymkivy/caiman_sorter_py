@@ -16,7 +16,7 @@ from dataclasses import fields
 
 from caiman_sorter_py import __version__
 from caiman_sorter_py.core.state import (
-    OPS_SUB_PREFIXES, OPS_TOP_FIELD_NAMES, Session,
+    OPS_SUB_PREFIXES, OPS_TOP_FIELD_NAMES, QSETTINGS_ONLY_SUBS, Session,
 )
 from caiman_sorter_py.ui.image_panel import ImagePanel
 from caiman_sorter_py.ui.merge_panel import MergePanel
@@ -444,6 +444,10 @@ class MainWindow(QMainWindow):
         cf.addRow(self.recompute_contours_btn)
         v.addWidget(contour_group)
 
+        # Plot orientation — GUI-only display tweaks (rotation + flips) that
+        # persist in QSettings but never get written to data files.
+        v.addWidget(self.params_panel.build_plot_group())
+
         # Reset actions — destructive session-wide buttons live here, not in
         # the right-side eval panel. ParamsPanel owns the widgets + signals.
         v.addWidget(self.params_panel.build_reset_group())
@@ -862,8 +866,10 @@ class MainWindow(QMainWindow):
     def _save_ops_settings(self) -> None:
         """Persist every Ops field to QSettings.
 
-        Driven by `OPS_SUB_PREFIXES` and `OPS_TOP_FIELD_NAMES` in core/state —
-        adding a new field to a sub-dataclass requires zero edits here.
+        Iterates `OPS_TOP_FIELD_NAMES`, `OPS_SUB_PREFIXES`, AND
+        `QSETTINGS_ONLY_SUBS`. The last group (currently just `plot`) is
+        QSettings-only — kept out of data files but still persisted across
+        app launches.
         """
         s   = self._settings
         ops = self.session.ops
@@ -871,7 +877,7 @@ class MainWindow(QMainWindow):
         for name in OPS_TOP_FIELD_NAMES:
             s.setValue(f"ops/{name}", getattr(ops, name))
 
-        for attr_name, prefix in OPS_SUB_PREFIXES.items():
+        for attr_name, prefix in {**OPS_SUB_PREFIXES, **QSETTINGS_ONLY_SUBS}.items():
             sub = getattr(ops, attr_name)
             for fld in fields(sub):
                 s.setValue(f"ops/{prefix}/{fld.name}", getattr(sub, fld.name))
@@ -903,7 +909,7 @@ class MainWindow(QMainWindow):
             default = getattr(ops, name)
             setattr(ops, name, _coerce(s.value(f"ops/{name}"), default))
 
-        for attr_name, prefix in OPS_SUB_PREFIXES.items():
+        for attr_name, prefix in {**OPS_SUB_PREFIXES, **QSETTINGS_ONLY_SUBS}.items():
             sub = getattr(ops, attr_name)
             for fld in fields(sub):
                 default = getattr(sub, fld.name)

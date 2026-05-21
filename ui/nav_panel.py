@@ -173,10 +173,12 @@ class NavPanel(QWidget):
         self.comp_ax = self.comp_fig.add_axes([0, 0, 1, 1])
         self.comp_ax.set_facecolor("#1e1e1e")
         self.comp_ax.axis("off")
-        # Persistent AxesImage; data swapped in via set_data on each cell change
+        # Persistent AxesImage; data swapped in via set_data on each cell change.
+        # origin="upper" matches MATLAB's imagesc default (row 0 at top); the
+        # display-orientation params layer rotation/flips on top per render.
         self._comp_im = self.comp_ax.imshow(
             np.zeros((1, 1)),
-            cmap="viridis", aspect="equal", origin="lower",
+            cmap="viridis", aspect="equal", origin="upper",
             interpolation="nearest",
         )
         self.comp_canvas = FigureCanvasQTAgg(self.comp_fig)
@@ -193,6 +195,7 @@ class NavPanel(QWidget):
         self.session.add_listener("cell_selected", self.update_cell_info)
         self.session.add_listener("cell_accepted_changed", self._on_accept_changed)
         self.session.add_listener("cells_reevaluated", self.update_counts)
+        self.session.add_listener("plot_params_changed", self._on_plot_params_changed)
 
         self.cell_spinner.valueChanged.connect(self._on_spinner_changed)
         self.accept_btn.clicked.connect(
@@ -218,6 +221,11 @@ class NavPanel(QWidget):
         self.update_counts()
         if cell_idx == self.session.current_cell:
             self.update_cell_info(cell_idx)
+
+    def _on_plot_params_changed(self) -> None:
+        """Re-render the per-cell footprint with the new orientation."""
+        if self.session.est is not None and self.session.proc is not None:
+            self.update_cell_info(self.session.current_cell)
 
     # ------------------------------------------------------------------
     # Public update methods
@@ -313,18 +321,23 @@ class NavPanel(QWidget):
         else:
             crop = footprint
 
+        # Apply the display-orientation transform last; clim percentiles are
+        # rotation/flip invariant so we compute them before the transform.
         nz = crop[crop > 0]
         vmin = float(np.percentile(nz, 0.5))  if len(nz) else 0
         vmax = float(np.percentile(nz, 99.5)) if len(nz) else 1e-9
 
+        from caiman_sorter_py.core.orient import transform_image
+        crop_disp = transform_image(crop, self.session.ops.plot)
+
         # Update the persistent AxesImage instead of cla()+imshow each time.
         # set_extent + matching axis limits handle differently-sized crops.
-        h, w = crop.shape
-        self._comp_im.set_data(crop)
+        h, w = crop_disp.shape
+        self._comp_im.set_data(crop_disp)
         self._comp_im.set_clim(vmin, vmax)
-        self._comp_im.set_extent((-0.5, w - 0.5, -0.5, h - 0.5))
+        self._comp_im.set_extent((-0.5, w - 0.5, h - 0.5, -0.5))   # y inverted for origin="upper"
         self.comp_ax.set_xlim(-0.5, w - 0.5)
-        self.comp_ax.set_ylim(-0.5, h - 0.5)
+        self.comp_ax.set_ylim(h - 0.5, -0.5)                       # y axis points down
         self.comp_canvas.draw_idle()
 
         # Show the current cell number in the group-box title

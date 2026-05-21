@@ -198,6 +198,7 @@ class ImagePanel(QWidget):
         self.session.add_listener("cell_selected", self.highlight_cell)
         self.session.add_listener("cell_accepted_changed", self.update_cell_toggle)
         self.session.add_listener("cells_reevaluated", self.refresh_images)
+        self.session.add_listener("plot_params_changed", self.refresh_images)
         self.metric_combo.currentTextChanged.connect(self._on_metric_changed)
         self.bkg_combo.currentTextChanged.connect(self._on_bkg_changed)
         self.accepted_canvas.mpl_connect("button_press_event", self._on_click)
@@ -280,9 +281,13 @@ class ImagePanel(QWidget):
         src_w    -= w * fp
         dst_w    += w * fp
 
-        # Re-render both composite images from the updated caches
-        acc_img = self._build_bg_image_for_side(True)
-        rej_img = self._build_bg_image_for_side(False)
+        # Re-render both composite images from the updated caches. Apply
+        # display-orientation last — the cached side-sums are kept in the
+        # original CaImAn dims so per-cell ±delta updates stay simple.
+        from caiman_sorter_py.core.orient import transform_image
+        plot = self.session.ops.plot
+        acc_img = transform_image(self._build_bg_image_for_side(True),  plot)
+        rej_img = transform_image(self._build_bg_image_for_side(False), plot)
         self._accepted_im.set_data(acc_img)
         self._rejected_im.set_data(rej_img)
         acc_clim = self._clim(acc_img)
@@ -300,6 +305,14 @@ class ImagePanel(QWidget):
                 except (ValueError, NotImplementedError):
                     pass
                 target_ax.add_line(line)
+                # Axes._set_artist_props only assigns transData when the line
+                # has none; ours was set during the first draw on the source
+                # axes. Each panel is its own QWidget/figure, and the splitter
+                # rarely gives the two canvases identical pixel widths — leaving
+                # the stale transform makes every data point project through
+                # the source figure's size, producing a small left/right shift
+                # whose direction depends on which side has the extra pixel.
+                line.set_transform(target_ax.transData)
 
         self._update_labels()
         # Re-apply current-cell highlight + canvas draws via existing helper
@@ -457,15 +470,20 @@ class ImagePanel(QWidget):
         return np.abs(wcomp_s)
 
     def _draw_backgrounds(self) -> None:
-        acc_img = self._build_bg_image_for_side(True)
-        rej_img = self._build_bg_image_for_side(False)
+        from caiman_sorter_py.core.orient import transform_image
+        plot = self.session.ops.plot
+        acc_img = transform_image(self._build_bg_image_for_side(True),  plot)
+        rej_img = transform_image(self._build_bg_image_for_side(False), plot)
 
+        # origin="upper" matches MATLAB's imagesc default (row 0 at top), so
+        # the default view aligns with the legacy sorter and ImageJ. The
+        # orientation params layer 90°-step rotation + flips on top.
         self._accepted_im = self.accepted_ax.imshow(
-            acc_img, cmap=self.CMAP, aspect="equal", origin="lower",
+            acc_img, cmap=self.CMAP, aspect="equal", origin="upper",
             interpolation="nearest", **self._clim(acc_img),
         )
         self._rejected_im = self.rejected_ax.imshow(
-            rej_img, cmap=self.CMAP, aspect="equal", origin="lower",
+            rej_img, cmap=self.CMAP, aspect="equal", origin="upper",
             interpolation="nearest", **self._clim(rej_img),
         )
 
@@ -547,8 +565,10 @@ class ImagePanel(QWidget):
         return (r, g, b)
 
     def _draw_all_contours(self) -> None:
+        from caiman_sorter_py.core.orient import transform_xy
         est  = self.session.est
         proc = self.session.proc
+        plot = self.session.ops.plot
         self._contour_lines.clear()
 
         if est.contours is None:
@@ -565,10 +585,14 @@ class ImagePanel(QWidget):
                 self._contour_lines.append(None)
                 continue
 
+            # Move contour coords into the displayed orientation. Coords are
+            # (x=col, y=row) in original est.dims coords; transform_xy returns
+            # the same shape after applying ops.plot's flip/rotate.
+            disp_coords, _ = transform_xy(coords, est.dims, plot)
             ax    = self.accepted_ax if proc.accepted[cell_idx] else self.rejected_ax
             color = self._cell_color(cell_idx, vals, color_range)
             line, = ax.plot(
-                coords[:, 0], coords[:, 1],
+                disp_coords[:, 0], disp_coords[:, 1],
                 color=color, lw=1.5, alpha=0.7, solid_capstyle="round",
             )
             self._contour_lines.append(line)
@@ -625,10 +649,17 @@ class ImagePanel(QWidget):
 
         est    = self.session.est
         proc   = self.session.proc
+        plot   = self.session.ops.plot
         height, width = est.dims
 
-        col = int(np.clip(round(event.xdata), 0, width  - 1))
-        row = int(np.clip(round(event.ydata), 0, height - 1))
+        # event.xdata / event.ydata are in DISPLAYED coords. Invert the
+        # orientation transform to recover the original (col, row) so the
+        # linear-pixel lookup against est.A still works.
+        from caiman_sorter_py.core.orient import inverse_xy
+        col_f, row_f = inverse_xy(float(event.xdata), float(event.ydata),
+                                  est.dims, plot)
+        col = int(np.clip(round(col_f), 0, width  - 1))
+        row = int(np.clip(round(row_f), 0, height - 1))
 
         if event.inaxes is self.accepted_ax:
             candidates = np.where(proc.accepted)[0]

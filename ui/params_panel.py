@@ -32,10 +32,59 @@ class ParamsPanel(QWidget):
         # in the center "Params" tab via main_window._build_params_tab —
         # not inside this right-side panel.
         self._reset_group = self._build_reset_group()
+        # Plot orientation lives in the center Params tab too; built here so
+        # signals are wired in _connect_session alongside the other widgets.
+        self._plot_group = self._build_plot_group()
 
     def build_reset_group(self) -> "QGroupBox":
         """Return the Reset groupbox for placement in the main-window Params tab."""
         return self._reset_group
+
+    def build_plot_group(self) -> "QGroupBox":
+        """Return the Plot orientation groupbox for the main-window Params tab."""
+        return self._plot_group
+
+    def _build_plot_group(self) -> "QGroupBox":
+        self.plot_group = QGroupBox("Plot orientation")
+        self.plot_group.setToolTip(
+            "Display-only rotation / mirroring for the accepted, rejected, and\n"
+            "single-cell component images. Underlying data is unchanged and\n"
+            "saved files are unaffected — this is a GUI preference that\n"
+            "persists across launches via QSettings."
+        )
+        pf = QFormLayout(self.plot_group)
+        pf.setContentsMargins(4, 4, 4, 4)
+        pf.setSpacing(4)
+
+        self.plot_rotation_combo = QComboBox()
+        self.plot_rotation_combo.addItems(["0°", "90°", "180°", "270°"])
+        self.plot_rotation_combo.setToolTip(
+            "Rotate the displayed images counter-clockwise by this many degrees.\n"
+            "Applied after the flip checkboxes."
+        )
+        pf.addRow("Rotation:", self.plot_rotation_combo)
+
+        self.plot_flip_h_chk = QCheckBox("Flip horizontal (mirror L–R)")
+        self.plot_flip_h_chk.setToolTip("Mirror the image left-to-right (applied before rotation).")
+        pf.addRow(self.plot_flip_h_chk)
+
+        self.plot_flip_v_chk = QCheckBox("Flip vertical (mirror T–B)")
+        self.plot_flip_v_chk.setToolTip("Mirror the image top-to-bottom (applied before rotation).")
+        pf.addRow(self.plot_flip_v_chk)
+
+        # Wire signals — write to ops then notify the session
+        self.plot_rotation_combo.currentIndexChanged.connect(self._on_plot_params_changed)
+        self.plot_flip_h_chk.toggled.connect(self._on_plot_params_changed)
+        self.plot_flip_v_chk.toggled.connect(self._on_plot_params_changed)
+        return self.plot_group
+
+    def _on_plot_params_changed(self, *_) -> None:
+        """Write plot widget state into ops.plot and trigger a re-render."""
+        plot = self.session.ops.plot
+        plot.rotation = self.plot_rotation_combo.currentIndex() * 90
+        plot.flip_h = self.plot_flip_h_chk.isChecked()
+        plot.flip_v = self.plot_flip_v_chk.isChecked()
+        self.session.notify_plot_params_changed()
 
     def _build_reset_group(self) -> "QGroupBox":
         self.reset_group = QGroupBox("Reset")
@@ -452,6 +501,19 @@ class ParamsPanel(QWidget):
         self.foopsi_scale.setValue(fp.scale)
         self.foopsi_shift.setValue(fp.shift)
 
+        # Plot orientation (GUI-only, restored from QSettings). Block signals
+        # so populating widgets from disk doesn't fire notify_plot_params_changed
+        # repeatedly before the session has anything to render.
+        pp = ops.plot
+        rot_idx = max(0, min(3, int(pp.rotation) // 90))
+        for w in (self.plot_rotation_combo, self.plot_flip_h_chk, self.plot_flip_v_chk):
+            w.blockSignals(True)
+        self.plot_rotation_combo.setCurrentIndex(rot_idx)
+        self.plot_flip_h_chk.setChecked(bool(pp.flip_h))
+        self.plot_flip_v_chk.setChecked(bool(pp.flip_v))
+        for w in (self.plot_rotation_combo, self.plot_flip_h_chk, self.plot_flip_v_chk):
+            w.blockSignals(False)
+
     def sync_to_ops(self) -> None:
         """Write all current control values into session.ops.
 
@@ -516,6 +578,13 @@ class ParamsPanel(QWidget):
         fp.smooth_sigma = self.foopsi_smooth_sigma.value()
         fp.scale        = self.foopsi_scale.value()
         fp.shift        = self.foopsi_shift.value()
+
+        # Plot orientation — written here for the close-without-edit path; the
+        # interactive path also writes via _on_plot_params_changed on toggle.
+        pp = ops.plot
+        pp.rotation = self.plot_rotation_combo.currentIndex() * 90
+        pp.flip_h   = self.plot_flip_h_chk.isChecked()
+        pp.flip_v   = self.plot_flip_v_chk.isChecked()
 
     def _on_evaluate(self) -> None:
         """Sync controls → ops, then re-evaluate."""
