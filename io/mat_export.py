@@ -52,7 +52,7 @@ def save_session_mat(path: str | Path, est, proc, ops,
 
     data = {
         "est":  _build_est(est, n_cells, n_frames),
-        "proc": _build_proc(proc, n_cells, n_frames),
+        "proc": _build_proc(proc, n_cells, n_frames, est.dims),
         "ops":  _ops_with_init_params(_build_ops(ops, source_path), est),
     }
 
@@ -171,7 +171,7 @@ def _build_est(est, n_cells: int, n_frames: int) -> dict:
 # /proc
 # ----------------------------------------------------------------------
 
-def _build_proc(proc, n_cells: int, n_frames: int) -> dict:
+def _build_proc(proc, n_cells: int, n_frames: int, dims: tuple) -> dict:
     """Mirror MATLAB proc struct.
 
     MATLAB shapes (column-major):
@@ -192,7 +192,10 @@ def _build_proc(proc, n_cells: int, n_frames: int) -> dict:
     out = {
         "num_cells":  float(n_cells),
         "num_frames": float(n_frames),
-        "dims":       _col(getattr(proc, "dims", (0, 0)) or (0, 0), dtype=np.int32),
+        # Proc has no dims field of its own — write the est dims so MATLAB
+        # code that reshapes via proc.dims (f_cs_compute_background_im.m)
+        # gets the actual FOV size, not (0, 0).
+        "dims":       _col(dims if dims else (0, 0), dtype=np.int32),
 
         "comp_accepted":      accepted.reshape(-1, 1),               # column vector
         "comp_accepted_core": core.reshape(-1, 1),   # bool → MATLAB_class='logical', same as comp_accepted

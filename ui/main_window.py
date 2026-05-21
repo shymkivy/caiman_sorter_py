@@ -497,10 +497,10 @@ class MainWindow(QMainWindow):
         start_dir = self._settings.value("last_browse_dir", "")
         path, _ = QFileDialog.getOpenFileName(
             self, "Open CaImAn or session file", start_dir,
-            "CaImAn / session / sort .mat (*.hdf5 *.h5 *.mat);;"
-            "Session HDF5 (*.h5);;"
+            "Readable files (*.hdf5 *.h5 *.mat);;"
+            "CaImAn / Session HDF5 (*.hdf5 *.h5);;"
             "Sort .mat (*.mat);;"
-            "Ops file (*_ops.h5);;"
+            "Ops file (*_ops.hdf5 *_ops.h5);;"
             "All files (*)"
         )
         if path:
@@ -662,7 +662,7 @@ class MainWindow(QMainWindow):
         default = self._default_save_path(source, tag, ".h5")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save session", default,
-            "Sort session HDF5 (*.h5);;All files (*)"
+            "Sort session HDF5 (*.h5 *.hdf5);;Sort .mat (*.mat);;All files (*)"
         )
         if not path:
             return
