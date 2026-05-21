@@ -73,11 +73,18 @@ def _read_est(g: h5py.Group) -> Estimates:
     cnn_preds = _read_1d(g, "cnn_preds", dtype=np.float32)
     r_values  = _read_1d(g, "r_values")
     sn        = _read_1d(g, "sn")
-    # b and f are CaImAn background components — keep their 2-D shapes:
-    #   b: (n_pixels, n_bg),  f: (n_bg, n_frames)
-    # so the image panel can reconstruct b @ mean(f, axis=1) without reshaping.
+    # b and f are CaImAn background components. The legacy MATLAB pipeline
+    # stores them transposed relative to CaImAn-Python's convention:
+    #   on-disk (MATLAB internal): b: (n_bg, n_pixels)   f: (n_frames, n_bg)
+    #   CaImAn-Python internal:    b: (n_pixels, n_bg)   f: (n_bg, n_frames)
+    # io.mat_export writes them in MATLAB orientation; reverse the transpose
+    # here so internal code (image panel, save_session) sees CaImAn shapes.
     bb        = _read_2d(g, "b")
     bg_f      = _read_2d(g, "f")
+    if bb is not None and bb.ndim == 2:
+        bb = bb.T
+    if bg_f is not None and bg_f.ndim == 2:
+        bg_f = bg_f.T
     neurons_sn = _read_1d(g, "neurons_sn")
 
     # AR coeffs: stored as (n_cells, p) in MATLAB, our internal is (p, n_cells)

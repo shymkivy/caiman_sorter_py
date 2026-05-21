@@ -56,13 +56,19 @@ def save_session_mat(path: str | Path, est, proc, ops,
         "ops":  _ops_with_init_params(_build_ops(ops, source_path), est),
     }
 
-    # Write everything except the sparse A
+    # `truncate_existing=True` makes hdf5storage open the target in 'w' mode
+    # instead of the default 'a' (append/update). The append path walks the
+    # existing file and runs `np.array_equal(new_attr, existing_attr)` for
+    # every dataset attribute (hdf5storage utilities.set_attributes_all); when
+    # the new and old shapes don't match, np.array_equal hits the multi-element
+    # `bool(a == b)` ambiguity and raises ValueError. Always overwrite cleanly.
     hs.savemat(str(path), data,
                format="7.3",
                matlab_compatible=True,
                store_python_metadata=False,
                compress=True,
-               compression_algorithm="gzip")
+               compression_algorithm="gzip",
+               truncate_existing=True)
 
     # Patch sparse A in manually
     _write_sparse_A(path, est.A)
@@ -82,9 +88,13 @@ def _build_est(est, n_cells: int, n_frames: int) -> dict:
       dims                : (2, 1) column
       sn                  : (n_pixels, 1) column
     """
+    # est.R is a legacy alias for YrA from the MATLAB pipeline — mirror it
+    # so downstream code that still reads est.R keeps working. Prefer YrA.
+    YrA = np.asarray(est.YrA, dtype=np.float64)
     out = {
         "C":     np.asarray(est.C,   dtype=np.float64),
-        "YrA":   np.asarray(est.YrA, dtype=np.float64),
+        "YrA":   YrA,
+        "R":     YrA,
         "S":     np.asarray(est.S,   dtype=np.float64),
         "F_dff": np.asarray(est.F_dff, dtype=np.float64),
         "SNR_comp":  _col(est.SNR_comp, dtype=np.float64),
@@ -94,6 +104,12 @@ def _build_est(est, n_cells: int, n_frames: int) -> dict:
         "idx_components":     _to_matlab_idx_col(est.idx_components),
         "idx_components_bad": _to_matlab_idx_col(est.idx_components_bad),
         "num_cells_original": float(est.num_cells_original or n_cells),
+        # Legacy MATLAB pipeline fields — written so downstream code that
+        # unconditionally reads them keeps working. num_cells_mod tracks the
+        # post-merge cell count; the two error logs are empty placeholders.
+        "num_cells_mod":        float(n_cells),
+        "error_log":            [],
+        "extraction_error_log": [],
     }
     # AR coeffs g: our internal est.g is (p, n_cells); pass through unchanged
     # to match MATLAB convention.
@@ -102,12 +118,42 @@ def _build_est(est, n_cells: int, n_frames: int) -> dict:
     # Optional fields (CaImAn HDF5 may omit some)
     if est.sn is not None:
         out["sn"] = _col(est.sn, dtype=np.float64)
+    # Background spatial / temporal components.
+    # Our internal CaImAn convention:    b: (n_pixels, n_bg)   f: (n_bg, n_frames)
+    # Legacy MATLAB pipeline convention: b: (n_bg, n_pixels)   f: (n_frames, n_bg)
+    # (verified against L_10_21_25_im1_results_cnmf_sort.mat — MATLAB stores
+    # b transposed and f transposed relative to CaImAn-Python). Transpose
+    # before hdf5storage so downstream MATLAB code that does e.g.
+    # `mean(est.f) * est.b` gets the shapes it expects.
     if est.b is not None:
-        out["b"] = np.asarray(est.b, dtype=np.float64)
+        b = np.asarray(est.b, dtype=np.float64)
+        if b.ndim == 1:
+            b = b.reshape(-1, 1)
+        out["b"] = b.T
     if est.f is not None:
-        out["f"] = np.asarray(est.f, dtype=np.float64)
+        ff = np.asarray(est.f, dtype=np.float64)
+        if ff.ndim == 1:
+            ff = ff.reshape(1, -1)
+        out["f"] = ff.T
     if est.neurons_sn is not None:
         out["neurons_sn"] = _col(est.neurons_sn, dtype=np.float64)
+
+    # Per-cell contours: cell array of (N, 2) double, columns (x=col, y=row).
+    # Python is 0-based, MATLAB is 1-based — offset by +1 so contour overlays
+    # align with imagesc in the legacy GUI. Missing/empty cells get a (0, 2)
+    # placeholder so `contours{n_cell}(:, 1)` still indexes without erroring.
+    contours_obj = np.empty(n_cells, dtype=object)
+    src = est.contours if est.contours is not None else []
+    for i in range(n_cells):
+        coords = None
+        if i < len(src) and isinstance(src[i], dict):
+            coords = src[i].get("coordinates")
+        if coords is None or len(coords) == 0:
+            contours_obj[i] = np.empty((0, 2), dtype=np.float64)
+        else:
+            contours_obj[i] = np.asarray(coords, dtype=np.float64) + 1.0
+    out["contours"] = contours_obj.reshape(1, -1)
+
     if est.eval_params_caiman:
         out["eval_params_caiman"] = _rename_eval_keys(
             _flatten_dict_to_scalars(est.eval_params_caiman)
@@ -149,9 +195,10 @@ def _build_proc(proc, n_cells: int, n_frames: int) -> dict:
         "dims":       _col(getattr(proc, "dims", (0, 0)) or (0, 0), dtype=np.int32),
 
         "comp_accepted":      accepted.reshape(-1, 1),               # column vector
-        "comp_accepted_core": core.astype(np.float64).reshape(-1, 1),
-        "idx_components":     _to_matlab_idx_col(np.where(accepted)[0]),
-        "idx_components_bad": _to_matlab_idx_col(np.where(~accepted)[0]),
+        "comp_accepted_core": core.reshape(-1, 1),   # bool → MATLAB_class='logical', same as comp_accepted
+        # MATLAB convention for proc indices is double (matches idx_manual below).
+        "idx_components":     _to_matlab_idx_col(np.where(accepted)[0]).astype(np.float64),
+        "idx_components_bad": _to_matlab_idx_col(np.where(~accepted)[0]).astype(np.float64),
         # idx_manual & idx_manual_bad are double in MATLAB and need to be
         # explicitly 2D so hdf5storage transposes them correctly even when empty
         # (np 1-D arrays end up as 1-D HDF5 datasets, breaking MATLAB shape parity).
@@ -220,37 +267,44 @@ def _build_proc_deconv(proc, n_cells: int, n_frames: int) -> dict:
         "S_std": sd_std,
     }
 
-    # foopsi → cell arrays of per-cell results (empty for unprocessed)
+    # foopsi → cell arrays of per-cell results (empty for unprocessed). Always
+    # emit the group (even when no foopsi has been run) to mirror the legacy
+    # MATLAB layout, where downstream code may read proc.deconv.c_foopsi.* uncond.
     fS = np.empty(n_cells, dtype=object)
     fC = np.empty(n_cells, dtype=object)
     fg = np.empty(n_cells, dtype=object)
     fp = np.empty(n_cells, dtype=object)
-    any_foopsi = False
     for i in range(n_cells):
         s = proc.foopsi.S[i] if i < len(proc.foopsi.S) else None
         c = proc.foopsi.C[i] if i < len(proc.foopsi.C) else None
         gi = proc.foopsi.g[i] if i < len(proc.foopsi.g) else None
-        if s is None and c is None and gi is None:
-            fS[i] = np.empty(0)
-            fC[i] = np.empty(0)
-            fg[i] = np.empty(0)
-            fp[i] = np.empty(0)
-            continue
-        any_foopsi = True
         fS[i] = np.asarray(s, dtype=np.float64) if s is not None else np.empty(0)
         fC[i] = np.asarray(c, dtype=np.float64) if c is not None else np.empty(0)
         gi_arr = np.asarray(gi, dtype=np.float64) if gi is not None else np.empty(0)
         fg[i] = gi_arr
-        fp[i] = float(gi_arr.size) if gi_arr.size else 1.0   # AR order per cell
+        fp[i] = float(gi_arr.size) if gi_arr.size else np.empty(0)   # AR order per cell
 
-    if any_foopsi:
-        # MATLAB cell arrays for c_foopsi are (1, n_cells) row of cells
-        deconv["c_foopsi"] = {
-            "S": fS.reshape(1, -1),
-            "C": fC.reshape(1, -1),
-            "g": fg.reshape(1, -1),
-            "p": fp.reshape(1, -1),
-        }
+    deconv["c_foopsi"] = {
+        "S": fS.reshape(1, -1),
+        "C": fC.reshape(1, -1),
+        "g": fg.reshape(1, -1),
+        "p": fp.reshape(1, -1),
+    }
+
+    # MCMC placeholder — Python sorter doesn't run MCMC, but the legacy MATLAB
+    # layout always carries C/S/SAMP cell arrays under proc.deconv.MCMC.
+    mC = np.empty(n_cells, dtype=object)
+    mS = np.empty(n_cells, dtype=object)
+    mSAMP = np.empty(n_cells, dtype=object)
+    for i in range(n_cells):
+        mC[i] = np.empty(0)
+        mS[i] = np.empty(0)
+        mSAMP[i] = np.empty(0)
+    deconv["MCMC"] = {
+        "C":    mC.reshape(1, -1),
+        "S":    mS.reshape(1, -1),
+        "SAMP": mSAMP.reshape(1, -1),
+    }
 
     return deconv
 
@@ -275,11 +329,10 @@ def _build_ops(ops, source_path: str) -> dict:
         "rval_lowest_thresh": float(ec.rval_lowest_thresh),
     }
 
-    # MATLAB stores ops booleans as `double` (0.0 / 1.0), not `logical`.
-    # We coerce all flag values to float so hdf5storage writes them as double
-    # and the on-disk MATLAB_class matches the reference _sort.mat files.
-    def _b(v) -> float:
-        return 1.0 if bool(v) else 0.0
+    # Eval / deconv toggles are MATLAB_class='logical' in the legacy file —
+    # return bool so hdf5storage emits logical, not double.
+    def _b(v) -> bool:
+        return bool(v)
 
     eval_params2 = {
         # Thresholds
@@ -303,7 +356,7 @@ def _build_ops(ops, source_path: str) -> dict:
     deconv = {
         "smooth_dfdt": {
             "params": {
-                "convolve_gaus":      1.0,
+                "convolve_gaus":      _b(True),
                 "gauss_kernel_simga": float(sd.gauss_sigma),
                 "rectify":            _b(sd.rectify),
                 "normalize":          _b(sd.normalize),
@@ -338,12 +391,12 @@ def _build_ops(ops, source_path: str) -> dict:
                 "AR_val":             "2",
                 "B_param":            200.0,
                 "Nsamples_param":     500.0,
-                "manual_tau":         0.0,
+                "manual_tau":         _b(False),
                 "manual_tau_rise":    0.1,
                 "manual_tau_decay":   0.4,
-                "convolve_gaus":      0.0,
+                "convolve_gaus":      _b(False),
                 "gauss_kernel_simga": 50.0,
-                "save_SAMP":          0.0,
+                "save_SAMP":          _b(False),
             },
             "gui": {
                 "scale_value": 1.0,
@@ -352,8 +405,9 @@ def _build_ops(ops, source_path: str) -> dict:
         },
     }
 
-    # MATLAB SwitchCaimanEvaluate values: 'caiman evaluate' or 'reject threshold'
-    switch_val = "caiman evaluate" if ops.eval_method == "caiman" else "reject threshold"
+    # Exact legacy MATLAB strings — case + 'threshhold' typo preserved so
+    # downstream MATLAB scripts doing strcmp() match what they always have.
+    switch_val = "CaImAn evaluate" if ops.eval_method == "caiman" else "Reject threshhold"
 
     out_ops = {
         "SwitchCaimanEvaluate": switch_val,
@@ -361,6 +415,10 @@ def _build_ops(ops, source_path: str) -> dict:
         "eval_params2":         eval_params2,
         "deconv":               deconv,
         "mat_file_loc":         _strip_nul(str(source_path or "")),
+        # Legacy MATLAB pipeline path fields — populated from ops so MATLAB
+        # f_cs_load_button_pushed.m's `browse_path` preservation still works.
+        "browse_path":          _strip_nul(str(getattr(ops, "browse_path", "") or "")),
+        "ops_path":             _strip_nul(str(getattr(ops, "ops_path",    "") or "")),
     }
     return out_ops
 

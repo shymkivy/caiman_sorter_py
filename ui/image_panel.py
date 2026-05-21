@@ -20,7 +20,8 @@ class _MinimalToolbar(NavigationToolbar2QT):
 class ImagePanel(QWidget):
     """Two side-by-side matplotlib images (accepted / rejected) with contour controls."""
 
-    METRICS  = ["None", "SNR (CaImAn)", "SNR2", "CNN", "R values", "Firing stability"]
+    METRICS  = ["None", "Manual", "SNR (CaImAn)", "SNR2", "CNN", "R values", "Firing stability"]
+    MANUAL_HIGHLIGHT_COLOR = "#ff8800"   # orange — manually-edited cells in "Manual" mode
     BKG_MODES = ["Components", "Weighted comp", "W comp + bkg"]
     CMAP     = "viridis"
 
@@ -75,7 +76,9 @@ class ImagePanel(QWidget):
         self.metric_combo.addItems(self.METRICS)
         self.metric_combo.setToolTip(
             "Color each cell's contour by a per-cell metric.\n"
-            "  • None  — accepted cells green, rejected red (no colorbar).\n"
+            "  • None    — accepted cells green, rejected red (no colorbar).\n"
+            "  • Manual  — manually-edited cells highlighted in orange; the rest\n"
+            "              keep their accepted/rejected colors.\n"
             "  • SNR (CaImAn) / CNN / R values — CaImAn-derived quality metrics.\n"
             "  • SNR2 / Firing stability — derived during proc init (peaks_ave/noise,\n"
             "    and a peak-rate firing-stability score).\n"
@@ -197,7 +200,7 @@ class ImagePanel(QWidget):
         self.session.add_listener("data_loaded", self._on_data_loaded)
         self.session.add_listener("cell_selected", self.highlight_cell)
         self.session.add_listener("cell_accepted_changed", self.update_cell_toggle)
-        self.session.add_listener("cells_reevaluated", self.refresh_images)
+        self.session.add_listener("cells_reevaluated", self._on_cells_reevaluated)
         self.session.add_listener("plot_params_changed", self.refresh_images)
         self.metric_combo.currentTextChanged.connect(self._on_metric_changed)
         self.bkg_combo.currentTextChanged.connect(self._on_bkg_changed)
@@ -218,6 +221,22 @@ class ImagePanel(QWidget):
         self._rej_wcomp_signed = None
         self._footprint_cache.clear()
         self._A_csr            = None
+        self.refresh_images()
+
+    def _on_cells_reevaluated(self) -> None:
+        """Bulk accept/reject change (Evaluate All, Reset manual, Reset merges).
+
+        n_cells and est.A are unchanged, so per-cell weights / footprint cache
+        / CSR shadow can be kept. But proc.accepted flipped in place — the
+        cached side-sum arrays (built from the OLD mask) need to be discarded
+        so _ensure_bkg_cache rebuilds them against the new mask. Without this
+        the contours migrate to the correct side but the composite background
+        images keep the previous composition.
+        """
+        self._acc_components   = None
+        self._rej_components   = None
+        self._acc_wcomp_signed = None
+        self._rej_wcomp_signed = None
         self.refresh_images()
 
     def refresh_images(self) -> None:
@@ -313,6 +332,14 @@ class ImagePanel(QWidget):
                 # the source figure's size, producing a small left/right shift
                 # whose direction depends on which side has the extra pixel.
                 line.set_transform(target_ax.transData)
+            # Recolor for the new accept state. In "None" metric mode this
+            # flips green↔red; when a metric is active the color is derived
+            # from the metric value and is independent of accept state, so
+            # the call is a no-op.
+            metric_text = self.metric_combo.currentText()
+            vals        = None if metric_text == "None" else self._get_metric_array(metric_text)
+            color_range = self._metric_percentile_range(vals)
+            line.set_color(self._cell_color(cell_idx, vals, color_range))
 
         self._update_labels()
         # Re-apply current-cell highlight + canvas draws via existing helper
@@ -554,8 +581,17 @@ class ImagePanel(QWidget):
         return float(np.percentile(finite, 5)), float(np.percentile(finite, 95))
 
     def _cell_color(self, cell_idx: int, vals, color_range):
+        # "Manual" mode short-circuits before the colormap path — manually-
+        # edited cells get the highlight color, others fall back to the
+        # accepted/rejected default so context isn't lost.
+        proc = self.session.proc
+        if self.metric_combo.currentText() == "Manual":
+            mo = proc.manual_override
+            if mo is not None and cell_idx < len(mo) and bool(mo[cell_idx]):
+                return self.MANUAL_HIGHLIGHT_COLOR
+            return "#00cc44" if proc.accepted[cell_idx] else "#cc3333"
         if vals is None or color_range is None:
-            return "#00cc44" if self.session.proc.accepted[cell_idx] else "#cc3333"
+            return "#00cc44" if proc.accepted[cell_idx] else "#cc3333"
         v = float(vals[cell_idx])
         if not np.isfinite(v):
             return "gray"

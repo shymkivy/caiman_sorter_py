@@ -21,6 +21,41 @@ class _SquareGroupBox(QGroupBox):
         self.setMaximumHeight(side)
 
 
+class _FilteredSpinBox(QSpinBox):
+    """QSpinBox whose stepBy honors a visible-cells filter callable.
+
+    Typing a number still sets the value directly (so the user can jump to any
+    cell regardless of filter). Only the up/down buttons (and the focused-in
+    keyboard arrows) are restricted — they walk through whichever cells the
+    `get_visible_cells` callable currently returns.
+    """
+
+    def __init__(self, get_visible_cells, parent=None):
+        super().__init__(parent)
+        self._get_visible_cells = get_visible_cells
+
+    def stepBy(self, steps: int) -> None:
+        cells = self._get_visible_cells()
+        if cells is None or len(cells) == 0:
+            super().stepBy(steps)
+            return
+        cur = self.value()
+        pos = int(np.searchsorted(cells, cur))
+        if pos < len(cells) and int(cells[pos]) == cur:
+            # cur is already in the filtered list — straightforward N-step move
+            new_pos = pos + steps
+        else:
+            # cur sits between visible cells: a single +step lands on the next
+            # visible cell ≥ cur (no "wasted" step), and a single −step lands
+            # on the previous visible cell < cur.
+            if steps > 0:
+                new_pos = pos + (steps - 1)
+            else:
+                new_pos = (pos - 1) + (steps + 1)
+        new_pos = max(0, min(len(cells) - 1, new_pos))
+        self.setValue(int(cells[new_pos]))
+
+
 # Metrics displayed in the info panel
 METRICS = [
     ("SNR (CaImAn)", "snr_caiman"),
@@ -71,14 +106,14 @@ class NavPanel(QWidget):
         # Spinner row
         row = QHBoxLayout()
         row.addWidget(QLabel("Cell:"))
-        self.cell_spinner = QSpinBox()
+        self.cell_spinner = _FilteredSpinBox(self._visible_cells)
         self.cell_spinner.setMinimum(0)
         self.cell_spinner.setMaximum(0)
         self.cell_spinner.setFixedWidth(70)
         self.cell_spinner.setToolTip(
-            "0-based cell index. Type a number or use arrows to jump to a cell.\n"
-            "You can also press ↑/↓ (or ←/→) while this panel has focus to step\n"
-            "through the cells matching the current filter (All/Accepted/Rejected)."
+            "0-based cell index. Type a number to jump to any cell directly.\n"
+            "The up/down arrows (and ↑/↓ while this panel has focus) walk only\n"
+            "through cells matching the current filter (All/Accepted/Rejected)."
         )
         row.addWidget(self.cell_spinner)
         self.total_label = QLabel("/ 0")
@@ -207,7 +242,8 @@ class NavPanel(QWidget):
         self._footprint_cache.clear()
         n = self.session.proc.num_cells
         self.cell_spinner.setMaximum(n - 1)
-        self.total_label.setText(f"/ {n}")
+        # Spinner is 0-based; show the highest valid index, not the count.
+        self.total_label.setText(f"/ {max(0, n - 1)}")
         self.accept_btn.setEnabled(True)
         self.reject_btn.setEnabled(True)
         self.update_counts()
@@ -252,7 +288,7 @@ class NavPanel(QWidget):
         if self.cell_spinner.value() >= n_tot:
             self.cell_spinner.setValue(max(0, n_tot - 1))
         self.cell_spinner.blockSignals(False)
-        self.total_label.setText(f"/ {n_tot}")
+        self.total_label.setText(f"/ {max(0, n_tot - 1)}")
         self._footprint_cache.clear()
 
     def update_cell_info(self, cell_idx: int) -> None:
@@ -344,8 +380,32 @@ class NavPanel(QWidget):
         state = "accepted" if accepted else "rejected"
         self.component_box.setTitle(f"Component — cell {cell_idx}  ({state})")
 
+    def _visible_cells(self):
+        """Return the 0-based indices of cells matching the current filter.
+
+        Returned in ascending order so that `_FilteredSpinBox.stepBy` can use
+        `np.searchsorted` for O(log n) navigation. Returns None if no session.
+        """
+        if self.session.proc is None:
+            return None
+        proc = self.session.proc
+        cat_idx = next(
+            (i for i, btn in enumerate(self._cat_group.buttons()) if btn.isChecked()),
+            0,
+        )
+        if cat_idx == 1:
+            return np.where(proc.accepted)[0]
+        if cat_idx == 2:
+            return np.where(~proc.accepted)[0]
+        return np.arange(proc.num_cells)
+
     def keyPressEvent(self, event) -> None:
-        """Up/down arrows navigate the currently filtered cell list."""
+        """Up/down/left/right arrows step through the currently filtered cells.
+
+        Fires only when the panel itself has focus (not the spinbox — that has
+        its own arrow handling via _FilteredSpinBox.stepBy). Both code paths
+        share `_visible_cells`, so the filter behaviour is identical.
+        """
         if self.session.est is None:
             super().keyPressEvent(event)
             return
@@ -355,23 +415,13 @@ class NavPanel(QWidget):
             super().keyPressEvent(event)
             return
 
-        proc = self.session.proc
-        cat_idx = next(
-            i for i, btn in enumerate(self._cat_group.buttons()) if btn.isChecked()
-        )
-        if cat_idx == 1:
-            cells = np.where(proc.accepted)[0]
-        elif cat_idx == 2:
-            cells = np.where(~proc.accepted)[0]
-        else:
-            cells = np.arange(proc.num_cells)
-
-        if len(cells) == 0:
+        cells = self._visible_cells()
+        if cells is None or len(cells) == 0:
             return
 
         cur = self.session.current_cell
         pos = int(np.searchsorted(cells, cur))
-        pos = np.clip(pos, 0, len(cells) - 1)
+        pos = int(np.clip(pos, 0, len(cells) - 1))
 
         if key in (Qt.Key_Up, Qt.Key_Left):
             pos = max(pos - 1, 0)

@@ -395,7 +395,9 @@ class MainWindow(QMainWindow):
         self.save_tag_edit.setToolTip(
             "String appended to the source stem when generating default save filenames.\n"
             "E.g. with tag '_sort' and source 'M1_results_cnmf.hdf5' the default save names are:\n"
-            "  M1_results_cnmf_sort.h5  and  M1_results_cnmf_sort.mat"
+            "  M1_results_cnmf_sort.h5  and  M1_results_cnmf_sort.mat\n"
+            "If the source stem already ends with this tag (e.g. you re-opened\n"
+            "M1_results_cnmf_sort.h5), the tag is not appended again."
         )
         self.save_tag_edit.textChanged.connect(
             lambda txt: setattr(self.session.ops, "save_tag", txt)
@@ -657,7 +659,7 @@ class MainWindow(QMainWindow):
 
         source = self._loaded_path
         tag = self.session.ops.save_tag or ""
-        default = self._default_save_path(source, suffix=f"{tag}.h5")
+        default = self._default_save_path(source, tag, ".h5")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save session", default,
             "Sort session HDF5 (*.h5);;All files (*)"
@@ -736,7 +738,7 @@ class MainWindow(QMainWindow):
         self.params_panel.sync_to_ops()
         source = self._loaded_path
         tag = self.session.ops.save_tag or ""
-        default = self._default_save_path(source, suffix=f"{tag}_ops.h5")
+        default = self._default_save_path(source, tag, "_ops.h5")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Ops", default,
             "Ops file (*_ops.h5);;HDF5 (*.h5);;All files (*)"
@@ -756,12 +758,20 @@ class MainWindow(QMainWindow):
             return
         self.log(f"Ops saved: {path}")
 
-    def _default_save_path(self, source: str, suffix: str) -> str:
-        """Pick a default filename based on the source HDF5: <source_stem><suffix>."""
+    def _default_save_path(self, source: str, tag: str, extra: str) -> str:
+        """Pick a default save path: <source_stem><tag><extra>.
+
+        Skips `tag` when the source stem already ends with it, so re-saving a
+        previously-sorted file (e.g. `M1_results_cnmf_sort.h5`) defaults to
+        the same filename instead of accumulating `_sort_sort…` suffixes.
+        """
         if not source:
             return ""
         p = Path(source)
-        return str(p.parent / (p.stem + suffix))
+        stem = p.stem
+        if tag and stem.endswith(tag):
+            return str(p.parent / (stem + extra))
+        return str(p.parent / (stem + tag + extra))
 
     def _on_data_loaded(self) -> None:
         self.save_btn.setEnabled(True)
