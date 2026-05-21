@@ -741,7 +741,7 @@ class MainWindow(QMainWindow):
         default = self._default_save_path(source, tag, "_ops.h5")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Ops", default,
-            "Ops file (*_ops.h5);;HDF5 (*.h5);;All files (*)"
+            "Ops file (*_ops.h5 *_ops.hdf5);;HDF5 (*.h5 *.hdf5);;All files (*)"
         )
         if not path:
             return
