@@ -39,7 +39,7 @@ Each method has its own panel.
 | Method | Dependencies | Notes |
 |---|---|---|
 | **Smooth dF/dt** | none | Gaussian-smoothed first-difference of `C + YrA`. Fast, no model. |
-| **Constrained foopsi** | `oasis` (default, ships with `caiman`) · `cvxpy` (`pip install cvxpy`) · `cvx` (`pip install cvxopt picos`) | Three interchangeable solvers for the same noise-constrained sparse-deconv problem; pick via the solver dropdown in the panel. |
+| **Constrained foopsi** | `oasis` (default, ships with `caiman`) — fast · `cvxpy` (`pip install cvxpy`) — convex interior-point · `cvx` (`pip install cvxopt picos`) — older | Noise-constrained sparse deconvolution. |
 
 Upstream repos:
 
