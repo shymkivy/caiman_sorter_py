@@ -14,6 +14,15 @@ class _MinimalToolbar(NavigationToolbar2QT):
     toolitems = [t for t in NavigationToolbar2QT.toolitems
                  if t[0] in ("Home", "Pan", "Zoom")]
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_home = None      # callable invoked AFTER home() completes
+
+    def home(self, *args, **kwargs):
+        super().home(*args, **kwargs)
+        if self._on_home is not None:
+            self._on_home()
+
 
 # Trace definitions: name → (label, default color, default visible)
 TRACES = {
@@ -37,6 +46,11 @@ class TracePanel(QWidget):
         self._t: np.ndarray | None = None   # time axis in seconds (cached on data load)
         self._fr_cached: float | None = None  # sampling rate cached alongside _t
         self._last_cell: int | None = None  # last cell shown; reset xlim/ylim only when this changes
+        # User-zoom state. When the user pans or zooms the trace plot, we stop
+        # auto-rescaling on trace toggles so their view survives. Cleared by
+        # cell change and by the toolbar Home button.
+        self._user_zoomed: bool = False
+        self._suppress_zoom_detect: bool = False
         self._build_ui()
         self._connect_session()
 
@@ -162,7 +176,19 @@ class TracePanel(QWidget):
             line.set_visible(self._toggles[name].isChecked())
             self._lines[name] = line
 
+        # Detect user pan/zoom by watching axis limit changes. Our own
+        # programmatic limit changes (cell change, rescale) are wrapped in
+        # _suppress_zoom_detect so they don't trip the flag.
+        self.ax.callbacks.connect('xlim_changed', self._on_view_change)
+        self.ax.callbacks.connect('ylim_changed', self._on_view_change)
+        # Home button → clear the user-zoom flag so the next toggle re-fits.
+        self.toolbar._on_home = lambda: setattr(self, '_user_zoomed', False)
+
         self.canvas.draw_idle()
+
+    def _on_view_change(self, ax):
+        if not self._suppress_zoom_detect:
+            self._user_zoomed = True
 
     def show_cell(self, cell_idx: int) -> None:
         """Update all trace data for a new cell."""
@@ -231,9 +257,15 @@ class TracePanel(QWidget):
             line.set_data(self._t, self._raw_data[name] * scale + shift)
 
         if cell_idx != self._last_cell:
-            # New cell: reset view to full range
-            self.ax.set_xlim(0, self._t[-1])
-            self._rescale_y()
+            # New cell: reset view to full range and clear the user-zoom
+            # flag — the previous cell's zoom doesn't apply to this one.
+            self._suppress_zoom_detect = True
+            try:
+                self.ax.set_xlim(0, self._t[-1])
+                self._rescale_y(force=True)
+            finally:
+                self._suppress_zoom_detect = False
+            self._user_zoomed = False
             self._last_cell = cell_idx
         else:
             # Same cell, data updated (e.g. deconv re-run or scale/shift):
@@ -241,10 +273,18 @@ class TracePanel(QWidget):
             self.canvas.draw_idle()
 
     def set_trace_visible(self, name: str, visible: bool) -> None:
-        """Show or hide a named trace without replotting."""
+        """Show or hide a named trace without replotting.
+
+        Auto-rescales y to the union of visible traces — UNLESS the user has
+        zoomed/panned the plot, in which case we preserve their view. They
+        can reset by clicking Home on the toolbar.
+        """
         if name in self._lines:
             self._lines[name].set_visible(visible)
-            self._rescale_y()
+            if self._user_zoomed:
+                self.canvas.draw_idle()
+            else:
+                self._rescale_y()
 
     # ------------------------------------------------------------------
     # Control callbacks
@@ -273,8 +313,17 @@ class TracePanel(QWidget):
             return ops.foopsi.scale, ops.foopsi.shift
         return 1.0, 0.0
 
-    def _rescale_y(self) -> None:
-        """Fit y-axis to the union of all currently visible traces."""
+    def _rescale_y(self, force: bool = False) -> None:
+        """Fit y-axis to the union of all currently visible traces.
+
+        Wraps the limit change in `_suppress_zoom_detect` so the change isn't
+        mistaken for a user pan/zoom. `force=True` lets callers bypass the
+        user-zoom guard (used internally on cell change).
+        """
+        if self._user_zoomed and not force:
+            self.canvas.draw_idle()
+            return
+
         ymin, ymax = np.inf, -np.inf
         for name, line in self._lines.items():
             if not line.get_visible() or name not in self._raw_data:
@@ -287,6 +336,11 @@ class TracePanel(QWidget):
 
         if np.isfinite(ymin) and np.isfinite(ymax) and ymax > ymin:
             pad = (ymax - ymin) * 0.05
-            self.ax.set_ylim(ymin - pad, ymax + pad)
+            prev_suppress = self._suppress_zoom_detect
+            self._suppress_zoom_detect = True
+            try:
+                self.ax.set_ylim(ymin - pad, ymax + pad)
+            finally:
+                self._suppress_zoom_detect = prev_suppress
 
         self.canvas.draw_idle()
