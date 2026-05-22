@@ -39,6 +39,13 @@ Each method has its own panel. The "constrained foopsi" panel exposes a solver d
 | Method | Dependencies | Notes |
 |---|---|---|
 | **Smooth dF/dt** | none | Gaussian-smoothed first-difference of `C + YrA`. Fast, no model. |
-| **Constrained foopsi — `oasis`** | none — comes with `caiman` | Fast. |
+| **Constrained foopsi — `oasis`** | none — ships with `caiman` | Fast. |
 | **Constrained foopsi — `cvxpy`** | `pip install cvxpy` | Convex interior-point solver. |
 | **Constrained foopsi — `cvx`** | `pip install cvxopt picos` | Older solver. |
+
+Upstream repos:
+
+- OASIS — [j-friedrich/OASIS](https://github.com/j-friedrich/OASIS)
+- cvxpy — [cvxpy/cvxpy](https://github.com/cvxpy/cvxpy)
+- cvxopt — [cvxopt/cvxopt](https://github.com/cvxopt/cvxopt)
+- picos — [gsagnol/picos](https://github.com/gsagnol/picos)
