@@ -34,14 +34,12 @@ python -m caiman_sorter_py
 
 ## Deconvolution
 
-Each method has its own panel. The "constrained foopsi" panel exposes a solver dropdown — the three rows below correspond to that dropdown.
+Each method has its own panel.
 
 | Method | Dependencies | Notes |
 |---|---|---|
 | **Smooth dF/dt** | none | Gaussian-smoothed first-difference of `C + YrA`. Fast, no model. |
-| **Constrained foopsi — `oasis`** | none — ships with `caiman` | Fast. |
-| **Constrained foopsi — `cvxpy`** | `pip install cvxpy` | Convex interior-point solver. |
-| **Constrained foopsi — `cvx`** | `pip install cvxopt picos` | Older solver. |
+| **Constrained foopsi** | `oasis` (default, ships with `caiman`) · `cvxpy` (`pip install cvxpy`) · `cvx` (`pip install cvxopt picos`) | Three interchangeable solvers for the same noise-constrained sparse-deconv problem; pick via the solver dropdown in the panel. |
 
 Upstream repos:
 
