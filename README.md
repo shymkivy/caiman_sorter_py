@@ -39,11 +39,10 @@ Each method has its own panel.
 | Method | Dependencies | Notes |
 |---|---|---|
 | **Smooth dF/dt** | none | Gaussian-smoothed first-difference of `C + YrA`. Fast, no model. |
-| **Constrained foopsi** | `oasis` (default, ships with `caiman`) — fast · `cvxpy` (`pip install cvxpy`) — convex interior-point · `cvx` (`pip install cvxopt picos`) — older | Noise-constrained sparse deconvolution. |
+| **Constrained foopsi** | `oasis/constrained foopsi` (default, ships with `caiman`) — fast · `cvxpy` (`pip install cvxpy`) — convex interior-point · `cvx` (`pip install cvxopt picos`) — older | Noise-constrained sparse deconvolution. |
 
 Upstream repos:
 
-- OASIS — [j-friedrich/OASIS](https://github.com/j-friedrich/OASIS)
+- oasis/constrained foopsi — [j-friedrich/OASIS](https://github.com/j-friedrich/OASIS)
 - cvxpy — [cvxpy/cvxpy](https://github.com/cvxpy/cvxpy)
-- cvxopt — [cvxopt/cvxopt](https://github.com/cvxopt/cvxopt)
-- picos — [gsagnol/picos](https://github.com/gsagnol/picos)
+- cvx — [cvxopt/cvxopt](https://github.com/cvxopt/cvxopt) + [gsagnol/picos](https://github.com/gsagnol/picos)
