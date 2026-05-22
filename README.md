@@ -42,12 +42,3 @@ Each method has its own panel. The "constrained foopsi" panel exposes a solver d
 | **Constrained foopsi — `oasis`** | none — comes with `caiman` | Fast. |
 | **Constrained foopsi — `cvxpy`** | `pip install cvxpy` | Convex interior-point solver. |
 | **Constrained foopsi — `cvx`** | `pip install cvxopt picos` | Older solver. |
-
-## Tests
-
-```
-cd <repo>/..
-python -m pytest caiman_sorter_py/tests
-```
-
-172 tests, no external file dependencies (all synthetic via `conftest.tiny_session`). Covers the math, the `est`/`proc`/`ops` round-trip through `.h5` and `.mat`, and the orientation/contour helpers.
