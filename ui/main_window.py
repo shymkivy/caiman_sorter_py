@@ -335,13 +335,16 @@ class MainWindow(QMainWindow):
         self.params_panel = ParamsPanel(self.session)
         self.nav_panel = NavPanel(self.session)
         self.merge_panel = MergePanel(self.session)
+        from caiman_sorter_py.ui.batch_panel import BatchPanel
+        self.batch_panel = BatchPanel(self.session)
 
-        # Center: tab widget (images / deconvolution / merge / params)
+        # Center: tab widget (images / deconvolution / merge / params / batch)
         self.center_tabs = QTabWidget()
         self.center_tabs.addTab(self.image_panel, "Images")
         self.center_tabs.addTab(self.params_panel.build_deconv_panel(), "Deconvolution")
         self.center_tabs.addTab(self.merge_panel, "Merge")
         self.center_tabs.addTab(self._build_params_tab(), "Params")
+        self.center_tabs.addTab(self.batch_panel, "Batch")
 
         # Left area: tabs on top, trace always visible below
         self.left_splitter = QSplitter(Qt.Vertical)
@@ -808,6 +811,7 @@ class MainWindow(QMainWindow):
 
         self._restore_ops_settings()
         self.params_panel.load_ops()
+        self.batch_panel.load_ops()
 
     def closeEvent(self, event) -> None:
         """Save window geometry, splitter sizes, and ops on close.
@@ -831,10 +835,16 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.StandardButton.Cancel:
                 event.ignore()
                 return
-            # User chose Abort — block briefly waiting for the workers, then quit
+            # User chose Abort — block briefly waiting for the workers, then quit.
+            # Batch worker has a cooperative stop flag (no event loop to .quit())
+            # — set it explicitly then wait the run() method out.
+            bw = self._batch_worker_or_none()
+            if bw is not None:
+                bw.stop()
             for w in (self._load_worker_or_none(),
                       self._save_worker_or_none(),
-                      self._foopsi_worker_or_none()):
+                      self._foopsi_worker_or_none(),
+                      bw):
                 if w is not None and w.isRunning():
                     w.quit()
                     w.wait(3000)   # ms — give threads a moment to wind down
@@ -866,11 +876,16 @@ class MainWindow(QMainWindow):
         w = getattr(self, "_foopsi_worker", None)
         return w if (w is not None and w.isRunning()) else None
 
+    def _batch_worker_or_none(self) -> "QThread | None":
+        w = getattr(self.batch_panel, "_worker", None)
+        return w if (w is not None and w.isRunning()) else None
+
     def _running_workers(self) -> list[str]:
         out = []
         if self._load_worker_or_none()   is not None: out.append("Load")
         if self._save_worker_or_none()   is not None: out.append("Save")
         if self._foopsi_worker_or_none() is not None: out.append("foopsi")
+        if self._batch_worker_or_none()  is not None: out.append("Batch")
         return out
 
     def _save_ops_settings(self) -> None:

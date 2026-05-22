@@ -273,6 +273,22 @@ class SpikesParams:
 
 
 @dataclass
+class BatchParams:
+    """Batch-processing tab — input directory + which steps to run.
+
+    GUI preference, NOT a data-file field. Persisted in QSettings only —
+    never written into per-file `.h5` / `.mat` outputs (which would be
+    nonsensical since these flags describe the run, not the data).
+    """
+    input_dir: str = ""
+    do_evaluate: bool = True
+    do_merge: bool = True
+    do_smooth_dfdt: bool = False
+    do_foopsi: bool = False
+    overwrite: bool = False
+
+
+@dataclass
 class PlotParams:
     """Display-only orientation of the spatial images.
 
@@ -310,6 +326,7 @@ class Ops:
     foopsi: DeconvParams = field(default_factory=DeconvParams)
     merge: MergeParams = field(default_factory=MergeParams)
     plot: PlotParams = field(default_factory=PlotParams)   # GUI-only; not written to data files
+    batch: BatchParams = field(default_factory=BatchParams) # GUI-only; not written to data files
     load_caiman_rejected: bool = False   # include CaImAn-rejected components on load
     save_tag: str = "_sort"              # string appended to source stem in default save names
     save_as_mat: bool = False            # also write a MATLAB-compatible .mat alongside the .h5 save
@@ -342,6 +359,7 @@ OPS_SUB_PREFIXES: dict[str, str] = {
 # while `_write_ops` / `_read_ops` only iterate `OPS_SUB_PREFIXES`.
 QSETTINGS_ONLY_SUBS: dict[str, str] = {
     "plot": "pl",
+    "batch": "bt",
 }
 
 # Top-level scalar attrs on Ops that should round-trip. Order doesn't matter.
