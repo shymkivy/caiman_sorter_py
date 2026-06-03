@@ -91,7 +91,8 @@ def initialize_proc(est, ops, log_cb=None) -> "Proc":
 
     Args:
         est: Estimates dataclass.
-        ops: Ops dataclass (unused directly; fr/params come from est.init_params_caiman).
+        ops: Ops dataclass. AR/metric params come from est.init_params_caiman,
+             but `ops.smooth_dfdt` seeds the initial smooth dF/dt result (see below).
         log_cb: Optional callable(str) for progress messages.
 
     Returns:
@@ -148,8 +149,7 @@ def initialize_proc(est, ops, log_cb=None) -> "Proc":
     _log("Computing firing stability...")
     firing_stab_vals = compute_firing_stability(est.S, fr)
 
-    _log(f"Proc initialization complete.")
-    return Proc(
+    proc = Proc(
         num_cells=n_cells,
         num_frames=n_frames,
         accepted=accepted,
@@ -166,6 +166,17 @@ def initialize_proc(est, ops, log_cb=None) -> "Proc":
         tauAR2=tauAR2,
         firing_stab_vals=firing_stab_vals,
     )
+
+    # Seed smooth dF/dt with the current (saved) params. The GUI computes it
+    # live for display only and has no "run" button, so without this the
+    # persisted proc.smooth_dfdt.S would be an all-zeros matrix on first save.
+    # It is fast (vectorised) and refreshed from live params again at save time.
+    _log("Computing smooth dF/dt...")
+    from caiman_sorter_py.core.deconvolution import run_smooth_dfdt
+    run_smooth_dfdt(est, proc, ops, log_cb=log_cb)
+
+    _log("Proc initialization complete.")
+    return proc
 
 
 # ---------------------------------------------------------------------------

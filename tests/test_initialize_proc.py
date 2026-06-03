@@ -180,3 +180,29 @@ def test_initialize_proc_zero_trace_does_not_crash():
     assert not np.any(np.isinf(proc.gAR1))
     assert not np.any(np.isinf(proc.gAR2))
     assert proc.peaks_ave[1] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_initialize_proc_seeds_smooth_dfdt(tiny_session):
+    """smooth dF/dt is populated at init (not left as an all-zeros matrix).
+
+    Regression: the GUI computes smooth dF/dt live for display only and has
+    no run button, so without an init-time seed proc.smooth_dfdt.S was all
+    None and saved out as a zeros (n_cells, n_frames) array.
+    """
+    est, _, _ = tiny_session
+    n_cells = est.A.shape[1]
+
+    proc = initialize_proc(est, Ops())
+
+    # Every cell has a per-frame result of the right length…
+    assert len(proc.smooth_dfdt.S) == n_cells
+    for i in range(n_cells):
+        s = proc.smooth_dfdt.S[i]
+        assert s is not None, f"cell {i} smooth_dfdt.S is None"
+        assert s.shape == (est.C.shape[1],), f"cell {i}: {s.shape}"
+    # …and at least one cell is non-zero (synthetic traces have signal).
+    assert any(np.any(proc.smooth_dfdt.S[i] != 0) for i in range(n_cells))
+    # std vector is sized and finite.
+    assert proc.smooth_dfdt_std is not None
+    assert proc.smooth_dfdt_std.shape == (n_cells,)
+    assert np.all(np.isfinite(proc.smooth_dfdt_std))

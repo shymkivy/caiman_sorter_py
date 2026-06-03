@@ -660,6 +660,13 @@ class MainWindow(QMainWindow):
         # Sync UI controls into ops so what we save matches what's on screen
         self.params_panel.sync_to_ops()
 
+        # Refresh smooth dF/dt from the current params before writing. There is
+        # no run button for it (it's a live display + init-time seed), so this
+        # is where on-screen param edits get baked into the saved result.
+        from caiman_sorter_py.core.deconvolution import run_smooth_dfdt
+        run_smooth_dfdt(self.session.est, self.session.proc, self.session.ops,
+                        log_cb=self.log)
+
         source = self._loaded_path
         tag = self.session.ops.save_tag or ""
         default = self._default_save_path(source, tag, ".h5")
