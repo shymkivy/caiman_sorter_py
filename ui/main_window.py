@@ -660,13 +660,6 @@ class MainWindow(QMainWindow):
         # Sync UI controls into ops so what we save matches what's on screen
         self.params_panel.sync_to_ops()
 
-        # Refresh smooth dF/dt from the current params before writing. There is
-        # no run button for it (it's a live display + init-time seed), so this
-        # is where on-screen param edits get baked into the saved result.
-        from caiman_sorter_py.core.deconvolution import run_smooth_dfdt
-        run_smooth_dfdt(self.session.est, self.session.proc, self.session.ops,
-                        log_cb=self.log)
-
         source = self._loaded_path
         tag = self.session.ops.save_tag or ""
         default = self._default_save_path(source, tag, ".h5")
@@ -678,6 +671,18 @@ class MainWindow(QMainWindow):
             return
         if not path.lower().endswith((".h5", ".hdf5")):
             path += ".h5"
+
+        # Refresh shaped (S_proc) traces from current params before writing (no
+        # run button, so this bakes in on-screen edits). smooth dF/dt is fully
+        # recomputed; foopsi S_proc is re-derived from the stored raw spikes
+        # (cheap, no solver re-run). After path commit so a cancelled save skips
+        # the work.
+        from caiman_sorter_py.core.deconvolution import (
+            refresh_foopsi_proc, run_smooth_dfdt,
+        )
+        run_smooth_dfdt(self.session.est, self.session.proc, self.session.ops,
+                        log_cb=self.log)
+        refresh_foopsi_proc(self.session.est, self.session.proc, self.session.ops)
 
         mat_path = self._mat_sidecar_path(path) if self.session.ops.save_as_mat else ""
 

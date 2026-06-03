@@ -108,6 +108,46 @@ def test_mat_proc_metrics_roundtrip(saved_mat_path):
             np.testing.assert_allclose(v2, v1, rtol=1e-5, atol=1e-7), name
 
 
+def test_mat_foopsi_raw_proc_roundtrip(saved_mat_path):
+    """foopsi raw S and shaped S_proc persist as distinct .mat cell arrays
+    (legacy `S` = raw, new `S_proc` = shaped) and round-trip separately."""
+    path, _, proc, _ = saved_mat_path
+    _, proc2, _ = load_session_mat(path)
+    # Cell 2 is the populated one (conftest); S and S_proc were set distinct.
+    assert not np.allclose(proc.foopsi.S[2], proc.foopsi.S_proc[2])
+    np.testing.assert_allclose(proc2.foopsi.S[2], proc.foopsi.S[2],
+                               rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(proc2.foopsi.S_proc[2], proc.foopsi.S_proc[2],
+                               rtol=1e-5, atol=1e-6)
+
+
+def test_mat_smooth_dfdt_raw_proc_roundtrip(tiny_session):
+    """smooth dF/dt round-trips raw (S) and shaped (S_proc) through the .mat,
+    where the legacy `S` slot carries the shaped trace for MATLAB compat."""
+    from caiman_sorter_py.core.deconvolution import run_smooth_dfdt
+    est, proc, ops = tiny_session
+    ops.smooth_dfdt.rectify = True
+    ops.smooth_dfdt.apply_thresh = True
+    ops.smooth_dfdt.threshold_z = 0.5
+    run_smooth_dfdt(est, proc, ops)
+    # Shaping makes the two differ for at least one cell.
+    n = est.A.shape[1]
+    assert any(not np.allclose(proc.smooth_dfdt.S[i], proc.smooth_dfdt.S_proc[i])
+               for i in range(n))
+
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "sd.mat")
+        save_session_mat(path, est, proc, ops, source_path="dummy.h5")
+        _, proc2, _ = load_session_mat(path)
+
+    for i in range(n):
+        np.testing.assert_allclose(proc2.smooth_dfdt.S[i], proc.smooth_dfdt.S[i],
+                                   rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(proc2.smooth_dfdt.S_proc[i],
+                                   proc.smooth_dfdt.S_proc[i],
+                                   rtol=1e-4, atol=1e-5)
+
+
 def test_mat_merge_parents_roundtrip(saved_mat_path):
     """merge_parents persists with 1-based MATLAB indices on disk; loader
     converts back to 0-based Python tuples."""

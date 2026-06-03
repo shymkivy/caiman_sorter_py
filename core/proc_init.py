@@ -167,10 +167,8 @@ def initialize_proc(est, ops, log_cb=None) -> "Proc":
         firing_stab_vals=firing_stab_vals,
     )
 
-    # Seed smooth dF/dt with the current (saved) params. The GUI computes it
-    # live for display only and has no "run" button, so without this the
-    # persisted proc.smooth_dfdt.S would be an all-zeros matrix on first save.
-    # It is fast (vectorised) and refreshed from live params again at save time.
+    # Seed smooth dF/dt: no GUI run button, so without this proc.smooth_dfdt.S
+    # would save as all zeros. Refreshed from live params at save time too.
     _log("Computing smooth dF/dt...")
     from caiman_sorter_py.core.deconvolution import run_smooth_dfdt
     run_smooth_dfdt(est, proc, ops, log_cb=log_cb)

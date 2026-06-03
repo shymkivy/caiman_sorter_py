@@ -282,8 +282,8 @@ class ParamsPanel(QWidget):
             "Specified in milliseconds — converted to frames using the frame rate."
         )
         self.dfdt_rectify.setToolTip("Set negative values to zero after smoothing (half-wave rectification).")
-        self.dfdt_normalize.setToolTip("Divide each cell's output by its absolute peak so traces are bounded by ±1.")
-        self.dfdt_thresh.setToolTip("Zero out values below threshold_z × std (per-cell).")
+        self.dfdt_normalize.setToolTip("Divide each cell's output by its signed maximum (matches MATLAB), scaling the largest positive deflection to 1.")
+        self.dfdt_thresh.setToolTip("Drop values below threshold_z × std (per-cell); survivors are shifted down by the threshold so it tapers to zero (no hard step).")
         self.dfdt_thresh_z.setToolTip("Z-score cutoff applied when 'Apply thresh' is checked.")
         self.dfdt_scale.setToolTip("Display-only scale applied to the final output trace.")
         self.dfdt_shift.setToolTip("Display-only offset applied to the final output trace.")
@@ -337,8 +337,9 @@ class ParamsPanel(QWidget):
             "Default 0.99 — values near 1 keep the estimate closer to raw."
         )
         self.foopsi_smooth_s.setToolTip(
-            "Apply Gaussian smoothing to the foopsi spike trace at display time.\n"
-            "Does not require re-running foopsi — updates the plot live."
+            "Gaussian-smooth the foopsi spike train. Updates the plot live (no\n"
+            "re-run needed) and is saved as the processed spikes (S_proc); the\n"
+            "raw spikes (S) are always kept unsmoothed."
         )
         self.foopsi_smooth_sigma.setToolTip(
             "Standard deviation of the Gaussian kernel applied to the foopsi spike trace,\n"

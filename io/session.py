@@ -245,22 +245,24 @@ def _write_deconv(g: h5py.Group, dr: DeconvResults,
     """Store per-cell DeconvResults packed to only the populated cells.
 
     For a session with k of n_cells run, this writes:
-      `idx`  (k,)            int32      cell indices that have data
-      `S`    (k, n_frames)   float64    deconvolved spikes
-      `C`    (k, n_frames)   float64    denoised calcium
-      `g`    (k, max_p)      float64    AR coeffs, NaN-padded
-      `done` (n_cells,)      bool       full mask (kept for back-compat readers)
+      `idx`    (k,)            int32      cell indices that have data
+      `S`      (k, n_frames)   float64    raw deconvolved spikes
+      `S_proc` (k, n_frames)   float64    shaped spikes (smoothing/threshold)
+      `C`      (k, n_frames)   float64    denoised calcium
+      `g`      (k, max_p)      float64    AR coeffs, NaN-padded
+      `done`   (n_cells,)      bool       full mask (kept for back-compat readers)
     Packing avoids the (n_cells, n_frames) transient float64 buffer when only
     a handful of cells have been processed.
     """
+    def _at(lst, i):
+        return lst[i] if i < len(lst) else None
+
     # Collect populated cell indices + sizes in one pass.
     idx_list: list[int] = []
     max_p = 0
     for i in range(n_cells):
-        s = dr.S[i] if i < len(dr.S) else None
-        c = dr.C[i] if i < len(dr.C) else None
-        gi = dr.g[i] if i < len(dr.g) else None
-        if s is None and c is None and gi is None:
+        s, sp, c, gi = _at(dr.S, i), _at(dr.S_proc, i), _at(dr.C, i), _at(dr.g, i)
+        if s is None and sp is None and c is None and gi is None:
             continue
         idx_list.append(i)
         if gi is not None:
@@ -271,43 +273,47 @@ def _write_deconv(g: h5py.Group, dr: DeconvResults,
     idx_arr = np.asarray(idx_list, dtype=np.int32)
     done[idx_arr] = True
 
-    S_arr = np.zeros((k, n_frames), dtype=np.float64)
-    C_arr = np.zeros((k, n_frames), dtype=np.float64)
-    g_arr = np.full((k, max(max_p, 1)), np.nan, dtype=np.float64)
+    S_arr  = np.zeros((k, n_frames), dtype=np.float64)
+    Sp_arr = np.zeros((k, n_frames), dtype=np.float64)
+    C_arr  = np.zeros((k, n_frames), dtype=np.float64)
+    g_arr  = np.full((k, max(max_p, 1)), np.nan, dtype=np.float64)
 
     for row, i in enumerate(idx_list):
-        s = dr.S[i] if i < len(dr.S) else None
-        c = dr.C[i] if i < len(dr.C) else None
-        gi = dr.g[i] if i < len(dr.g) else None
+        s, sp, c, gi = _at(dr.S, i), _at(dr.S_proc, i), _at(dr.C, i), _at(dr.g, i)
         if s is not None:
             S_arr[row, :len(s)] = np.asarray(s, dtype=np.float64)
+        if sp is not None:
+            Sp_arr[row, :len(sp)] = np.asarray(sp, dtype=np.float64)
         if c is not None:
             C_arr[row, :len(c)] = np.asarray(c, dtype=np.float64)
         if gi is not None:
             gi_arr = np.asarray(gi, dtype=np.float64).flatten()
             g_arr[row, :gi_arr.size] = gi_arr
 
-    g.create_dataset("idx",  data=idx_arr)
-    g.create_dataset("S",    data=S_arr, compression="gzip", chunks=True)
-    g.create_dataset("C",    data=C_arr, compression="gzip", chunks=True)
-    g.create_dataset("g",    data=g_arr)
-    g.create_dataset("done", data=done)
+    g.create_dataset("idx",    data=idx_arr)
+    g.create_dataset("S",      data=S_arr,  compression="gzip", chunks=True)
+    g.create_dataset("S_proc", data=Sp_arr, compression="gzip", chunks=True)
+    g.create_dataset("C",      data=C_arr,  compression="gzip", chunks=True)
+    g.create_dataset("g",      data=g_arr)
+    g.create_dataset("done",   data=done)
 
 
 def _read_deconv(g: h5py.Group, n_cells: int, n_frames: int) -> DeconvResults:
     done = np.asarray(g["done"][:]) if "done" in g else np.zeros(n_cells, dtype=bool)
-    S = g["S"][:] if "S" in g else None
-    C = g["C"][:] if "C" in g else None
-    G = g["g"][:] if "g" in g else None
+    S  = g["S"][:] if "S" in g else None
+    Sp = g["S_proc"][:] if "S_proc" in g else None   # absent in pre-1.03 files
+    C  = g["C"][:] if "C" in g else None
+    G  = g["g"][:] if "g" in g else None
 
     dr = DeconvResults(
         S=[None] * n_cells,
+        S_proc=[None] * n_cells,
         C=[None] * n_cells,
         g=[None] * n_cells,
     )
 
     if "idx" in g:
-        # Packed format: S/C/g are (k, n_frames), idx maps row → cell.
+        # Packed format: S/S_proc/C/g are (k, n_frames), idx maps row → cell.
         idx_arr = np.asarray(g["idx"][:], dtype=np.int64)
         for row, i in enumerate(idx_arr):
             i = int(i)
@@ -315,6 +321,9 @@ def _read_deconv(g: h5py.Group, n_cells: int, n_frames: int) -> DeconvResults:
                 continue
             if S is not None:
                 dr.S[i] = S[row].copy()
+            # Pre-S_proc files: fall back to the raw S so it's never empty.
+            dr.S_proc[i] = Sp[row].copy() if Sp is not None else (
+                S[row].copy() if S is not None else None)
             if C is not None:
                 dr.C[i] = C[row].copy()
             if G is not None:
@@ -329,6 +338,8 @@ def _read_deconv(g: h5py.Group, n_cells: int, n_frames: int) -> DeconvResults:
             continue
         if S is not None:
             dr.S[i] = S[i].copy()
+        dr.S_proc[i] = Sp[i].copy() if Sp is not None else (
+            S[i].copy() if S is not None else None)
         if C is not None:
             dr.C[i] = C[i].copy()
         if G is not None:

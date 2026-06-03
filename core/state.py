@@ -161,10 +161,17 @@ class Estimates:
 
 @dataclass
 class DeconvResults:
-    """Deconvolution results for one method, stored per cell."""
-    S: list = field(default_factory=list)    # spike trains, one array per cell
-    C: list = field(default_factory=list)    # denoised traces, one per cell
-    g: list = field(default_factory=list)    # AR coefficients, one per cell
+    """Deconvolution results for one method, stored per cell.
+
+    `S` is the raw method output (foopsi: OASIS spikes; smooth dF/dt: the
+    Gaussian-smoothed derivative). `S_proc` is `S` with the GUI trace-shaping
+    applied (foopsi: optional "Smooth S"; smooth dF/dt: normalize/rectify/
+    threshold). Display-only scale/shift are NOT baked into either.
+    """
+    S: list = field(default_factory=list)       # raw spike trains, one array per cell
+    S_proc: list = field(default_factory=list)  # shaped S (smoothing/threshold), one per cell
+    C: list = field(default_factory=list)       # denoised traces, one per cell
+    g: list = field(default_factory=list)       # AR coefficients, one per cell
 
 
 @dataclass
@@ -195,7 +202,7 @@ class Proc:
 
     # Deconvolution outputs (populated on demand)
     smooth_dfdt: DeconvResults = field(default_factory=DeconvResults)
-    smooth_dfdt_std: Optional[np.ndarray] = None  # (n_cells,) std of smooth_dfdt.S
+    smooth_dfdt_std: Optional[np.ndarray] = None  # (n_cells,) std of smooth_dfdt.S_proc
     foopsi: DeconvResults = field(default_factory=DeconvResults)
 
     # Per-merge parent record. Index k of this list is the parents of the

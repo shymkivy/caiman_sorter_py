@@ -265,3 +265,74 @@ def test_threshold_helper_disabled_is_noop():
     p = SmoothDfdtParams(apply_thresh=False)
     out = apply_smooth_dfdt_threshold(out_in, p)
     np.testing.assert_array_equal(out, out_in)
+
+
+# ----------------------------------------------------------------------
+# raw (S) vs shaped (S_proc) split
+# ----------------------------------------------------------------------
+
+def test_run_smooth_dfdt_raw_vs_proc(tiny_session):
+    """run_smooth_dfdt stores the bare smoothed derivative in S and the
+    normalize/rectify/threshold-shaped trace in S_proc; with shaping enabled
+    the two differ, and S matches compute_smooth_dfdt_raw."""
+    from caiman_sorter_py.core.deconvolution import (
+        compute_smooth_dfdt_raw, run_smooth_dfdt,
+    )
+    from caiman_sorter_py.core.state import Ops, get_init_param
+
+    est, _, _ = tiny_session
+    n_cells = est.A.shape[1]
+    ops = Ops()
+    ops.smooth_dfdt.normalize = True
+    ops.smooth_dfdt.rectify = True
+    ops.smooth_dfdt.apply_thresh = True
+    ops.smooth_dfdt.threshold_z = 1.0
+
+    proc = Proc(num_cells=n_cells, num_frames=est.C.shape[1])
+    run_smooth_dfdt(est, proc, ops)
+
+    fr = float(get_init_param(est.init_params_caiman, "fr", 30))
+    expected_raw = compute_smooth_dfdt_raw(est.C + est.YrA, fr, ops.smooth_dfdt)
+
+    differ = 0
+    for i in range(n_cells):
+        assert proc.smooth_dfdt.S[i] is not None
+        assert proc.smooth_dfdt.S_proc[i] is not None
+        np.testing.assert_allclose(proc.smooth_dfdt.S[i], expected_raw[i],
+                                   rtol=1e-5, atol=1e-5)
+        # rectify means S_proc has no negatives; raw generally does.
+        assert (proc.smooth_dfdt.S_proc[i] >= 0).all()
+        if not np.allclose(proc.smooth_dfdt.S[i], proc.smooth_dfdt.S_proc[i]):
+            differ += 1
+    assert differ > 0, "shaping should change at least one cell"
+
+
+def test_refresh_foopsi_proc_smooths_raw(tiny_session):
+    """refresh_foopsi_proc derives S_proc from the stored raw S using the
+    current Smooth-S params, without touching S."""
+    from caiman_sorter_py.core.deconvolution import refresh_foopsi_proc, _ensure_lists
+    from caiman_sorter_py.core.state import Ops
+
+    est, _, _ = tiny_session
+    n_cells = est.A.shape[1]
+    proc = Proc(num_cells=n_cells, num_frames=est.C.shape[1])
+    _ensure_lists(proc.foopsi, n_cells)
+    rng = np.random.default_rng(7)
+    raw = rng.standard_normal(est.C.shape[1]).astype(np.float32)
+    proc.foopsi.S[0] = raw.copy()
+
+    # Smoothing off → S_proc equals raw.
+    ops = Ops(); ops.foopsi.smooth_s = False
+    refresh_foopsi_proc(est, proc, ops)
+    np.testing.assert_array_equal(proc.foopsi.S[0], raw)
+    np.testing.assert_allclose(proc.foopsi.S_proc[0], raw, rtol=1e-5, atol=1e-5)
+
+    # Smoothing on → S unchanged, S_proc differs and is smoother (lower variance).
+    ops.foopsi.smooth_s = True
+    ops.foopsi.smooth_sigma = 100.0
+    refresh_foopsi_proc(est, proc, ops)
+    np.testing.assert_array_equal(proc.foopsi.S[0], raw)
+    assert not np.allclose(proc.foopsi.S_proc[0], raw)
+    assert proc.foopsi.S_proc[0].var() < raw.var()
+    # Cells without a raw result stay None.
+    assert proc.foopsi.S_proc[1] is None

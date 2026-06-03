@@ -252,12 +252,19 @@ def _build_proc(proc, n_cells: int, n_frames: int, dims: tuple) -> dict:
 def _build_proc_deconv(proc, n_cells: int, n_frames: int) -> dict:
     deconv: dict = {}
 
-    # smooth_dfdt → dense (n_cells, n_frames) matrix + (n_cells, 1) std column vector
-    sd_S = np.zeros((n_cells, n_frames), dtype=np.float64)
-    for i in range(min(n_cells, len(proc.smooth_dfdt.S))):
-        s = proc.smooth_dfdt.S[i]
-        if s is not None:
-            sd_S[i, :len(s)] = np.asarray(s, dtype=np.float64)
+    # smooth_dfdt → dense (n_cells, n_frames) matrices.
+    # Legacy MATLAB slot `S` holds the *shaped* trace (S_proc), matching the
+    # reference pipeline's output; `S_raw` is the new bare smoothed-derivative.
+    def _dense(lst) -> np.ndarray:
+        out = np.zeros((n_cells, n_frames), dtype=np.float64)
+        for i in range(min(n_cells, len(lst))):
+            s = lst[i]
+            if s is not None:
+                out[i, :len(s)] = np.asarray(s, dtype=np.float64)
+        return out
+
+    sd_proc = _dense(proc.smooth_dfdt.S_proc)
+    sd_raw  = _dense(proc.smooth_dfdt.S)
 
     # S_std is (1, n_cells) row vector in MATLAB — pass Python (1, n_cells) so
     # MATLAB sees a row vector (matching the reference _sort.mat shape).
@@ -266,7 +273,8 @@ def _build_proc_deconv(proc, n_cells: int, n_frames: int) -> dict:
     sd_std = np.asarray(sd_std_src, dtype=np.float64).reshape(1, -1)
 
     deconv["smooth_dfdt"] = {
-        "S":     sd_S,
+        "S":     sd_proc,
+        "S_raw": sd_raw,
         "S_std": sd_std,
     }
 
@@ -274,24 +282,31 @@ def _build_proc_deconv(proc, n_cells: int, n_frames: int) -> dict:
     # emit the group (even when no foopsi has been run) to mirror the legacy
     # MATLAB layout, where downstream code may read proc.deconv.c_foopsi.* uncond.
     fS = np.empty(n_cells, dtype=object)
+    fSp = np.empty(n_cells, dtype=object)
     fC = np.empty(n_cells, dtype=object)
     fg = np.empty(n_cells, dtype=object)
     fp = np.empty(n_cells, dtype=object)
     for i in range(n_cells):
         s = proc.foopsi.S[i] if i < len(proc.foopsi.S) else None
+        sp = proc.foopsi.S_proc[i] if i < len(proc.foopsi.S_proc) else None
         c = proc.foopsi.C[i] if i < len(proc.foopsi.C) else None
         gi = proc.foopsi.g[i] if i < len(proc.foopsi.g) else None
         fS[i] = np.asarray(s, dtype=np.float64) if s is not None else np.empty(0)
+        # Legacy `S` = raw spikes; `S_proc` (new) = shaped (Smooth S). Fall back
+        # to raw when no shaped copy exists so the cell array stays aligned.
+        sp = sp if sp is not None else s
+        fSp[i] = np.asarray(sp, dtype=np.float64) if sp is not None else np.empty(0)
         fC[i] = np.asarray(c, dtype=np.float64) if c is not None else np.empty(0)
         gi_arr = np.asarray(gi, dtype=np.float64) if gi is not None else np.empty(0)
         fg[i] = gi_arr
         fp[i] = float(gi_arr.size) if gi_arr.size else np.empty(0)   # AR order per cell
 
     deconv["c_foopsi"] = {
-        "S": fS.reshape(1, -1),
-        "C": fC.reshape(1, -1),
-        "g": fg.reshape(1, -1),
-        "p": fp.reshape(1, -1),
+        "S":      fS.reshape(1, -1),
+        "S_proc": fSp.reshape(1, -1),
+        "C":      fC.reshape(1, -1),
+        "g":      fg.reshape(1, -1),
+        "p":      fp.reshape(1, -1),
     }
 
     # MCMC placeholder — Python sorter doesn't run MCMC, but the legacy MATLAB

@@ -179,10 +179,13 @@ def _read_proc(g: h5py.Group, est: Estimates) -> Proc:
         deconv = g["deconv"]
         if "smooth_dfdt" in deconv:
             sdg = deconv["smooth_dfdt"]
-            S = _read_2d(sdg, "S")
+            S = _read_2d(sdg, "S")           # legacy slot = shaped (S_proc)
+            S_raw = _read_2d(sdg, "S_raw")   # new; absent on pre-1.03 files
             std = _read_1d(sdg, "S_std")
             if S is not None and S.shape and S.size:
-                proc.smooth_dfdt = _dense_to_deconv_results(S, None, None, n_cells)
+                # raw = S_raw when present, else fall back to the shaped trace.
+                proc.smooth_dfdt = _dense_to_deconv_results(
+                    S_raw if S_raw is not None and S_raw.size else S, S, n_cells)
             if std is not None and std.size == n_cells:
                 proc.smooth_dfdt_std = std
         if "c_foopsi" in deconv:
@@ -203,23 +206,24 @@ def _read_proc(g: h5py.Group, est: Estimates) -> Proc:
     return proc
 
 
-def _dense_to_deconv_results(S: np.ndarray, C: Optional[np.ndarray],
-                             G: Optional[np.ndarray], n_cells: int
-                             ) -> DeconvResults:
-    """Convert a dense (n_cells, n_frames) matrix into a per-cell list.
+def _dense_to_deconv_results(S_raw: np.ndarray, S_proc: np.ndarray,
+                             n_cells: int) -> DeconvResults:
+    """Convert dense (n_cells, n_frames) raw + shaped matrices into per-cell lists.
 
-    Empty rows (all zeros) stay None so unprocessed cells are distinguishable.
+    Used for smooth dF/dt (no C/g). Empty rows (all zeros) stay None so
+    unprocessed cells are distinguishable. `S_proc` falls back to `S_raw`
+    per-row when it is missing/empty.
     """
-    dr = DeconvResults(S=[None] * n_cells, C=[None] * n_cells, g=[None] * n_cells)
-    for i in range(min(n_cells, S.shape[0])):
-        row = S[i]
-        if not np.any(row):
+    dr = DeconvResults(S=[None] * n_cells, S_proc=[None] * n_cells,
+                       C=[None] * n_cells, g=[None] * n_cells)
+    for i in range(min(n_cells, S_raw.shape[0])):
+        raw = S_raw[i]
+        if not np.any(raw):
             continue
-        dr.S[i] = row.astype(np.float32)
-        if C is not None:
-            dr.C[i] = C[i].astype(np.float32)
-        if G is not None:
-            dr.g[i] = G[i].astype(np.float32)
+        dr.S[i] = raw.astype(np.float32)
+        proc_row = S_proc[i] if S_proc is not None and i < S_proc.shape[0] else None
+        dr.S_proc[i] = (proc_row if proc_row is not None and np.any(proc_row)
+                        else raw).astype(np.float32)
     return dr
 
 
@@ -229,7 +233,8 @@ def _read_foopsi_cells(fp_group: h5py.Group, n_cells: int) -> DeconvResults:
     Each field in fp_group is a (1, n_cells) dataset of HDF5 object references
     pointing to the per-cell arrays.
     """
-    dr = DeconvResults(S=[None] * n_cells, C=[None] * n_cells, g=[None] * n_cells)
+    dr = DeconvResults(S=[None] * n_cells, S_proc=[None] * n_cells,
+                       C=[None] * n_cells, g=[None] * n_cells)
     f = fp_group.file
 
     def _cells_for(name: str) -> list:
@@ -256,6 +261,11 @@ def _read_foopsi_cells(fp_group: h5py.Group, n_cells: int) -> DeconvResults:
     dr.S = _cells_for("S")
     dr.C = _cells_for("C")
     dr.g = _cells_for("g")
+    # `S_proc` (new) = shaped spikes; pre-1.03 files lack it → fall back to raw.
+    if "S_proc" in fp_group:
+        dr.S_proc = _cells_for("S_proc")
+    else:
+        dr.S_proc = [s.copy() if s is not None else None for s in dr.S]
     return dr
 
 

@@ -115,8 +115,8 @@ def _pick_g(proc, n_cell: int, params, dt: float) -> Optional[np.ndarray]:
 # ----------------------------------------------------------------------
 
 def _ensure_lists(deconv_results, n_cells: int) -> None:
-    """Resize DeconvResults.S/C/g to n_cells, preserving existing entries."""
-    for attr in ("S", "C", "g"):
+    """Resize DeconvResults.S/S_proc/C/g to n_cells, preserving existing entries."""
+    for attr in ("S", "S_proc", "C", "g"):
         lst = getattr(deconv_results, attr)
         if len(lst) != n_cells:
             new = [None] * n_cells
@@ -129,13 +129,32 @@ def _ensure_lists(deconv_results, n_cells: int) -> None:
 # 1. Smooth dF/dt  --  vectorised across cells
 # ----------------------------------------------------------------------
 
+def compute_smooth_dfdt_raw(data: np.ndarray, fr: float, params) -> np.ndarray:
+    """Raw smooth dF/dt: the Gaussian-smoothed temporal derivative only.
+
+    This is the bare method output — `gaussian_filter1d(diff(C + YrA))` — with
+    none of the normalize/rectify/threshold shaping. It is what gets stored in
+    `DeconvResults.S`. `gauss_sigma` is the only param read here.
+
+    Args:
+        data: (n_cells, n_frames) array of raw C + YrA traces.
+        fr:   frame rate in Hz.
+
+    Returns:
+        (n_cells, n_frames) smoothed-derivative array.
+    """
+    dt_ms = 1000.0 / fr
+    sigma_frames = max(params.gauss_sigma / dt_ms, 0.5)
+    deriv = np.diff(data, axis=1, prepend=data[:, :1])
+    return gaussian_filter1d(deriv, sigma=sigma_frames, axis=1, mode="reflect")
+
+
 def compute_smooth_dfdt(data: np.ndarray, fr: float, params) -> np.ndarray:
-    """Smooth dF/dt computation — mirrors MATLAB f_smooth_dfdt3.m.
+    """Smooth dF/dt with normalize + rectify applied — mirrors f_smooth_dfdt3.m.
 
     Pipeline (matches `caiman_sorter/caiman_sorter_functions/deconvolution_dep/
     f_smooth_dfdt3.m`):
-        deriv      = [0, diff(row)]
-        smoothed   = gaussian_filter1d(deriv, sigma_frames)
+        smoothed   = compute_smooth_dfdt_raw(...)
         if normalize: smoothed / max(smoothed)   # signed max, matches MATLAB
         if rectify : max(smoothed, 0)
 
@@ -145,17 +164,12 @@ def compute_smooth_dfdt(data: np.ndarray, fr: float, params) -> np.ndarray:
     Args:
         data:   (n_cells, n_frames) array of raw C + YrA traces.
         fr:     frame rate in Hz.
-        params: SmoothDfdtParams (only gauss_sigma / normalize / rectify are
-                read by this function).
+        params: SmoothDfdtParams (gauss_sigma / normalize / rectify are read).
 
     Returns:
-        (n_cells, n_frames) smoothed-dF/dt array.
+        (n_cells, n_frames) shaped-dF/dt array.
     """
-    dt_ms = 1000.0 / fr
-    sigma_frames = max(params.gauss_sigma / dt_ms, 0.5)
-
-    deriv = np.diff(data, axis=1, prepend=data[:, :1])
-    out   = gaussian_filter1d(deriv, sigma=sigma_frames, axis=1, mode="reflect")
+    out = compute_smooth_dfdt_raw(data, fr, params)
 
     if params.normalize:
         # Signed max, matching MATLAB `temp_data / max(temp_data)`. Guard
@@ -190,8 +204,10 @@ def run_smooth_dfdt(est, proc, ops,
                     log_cb: Optional[Callable[[str], None]] = None) -> None:
     """Compute smooth dF/dt for the given cells and store in proc.
 
-    Output stored in proc.smooth_dfdt.S as a list of per-cell arrays.
-    proc.smooth_dfdt_std is populated with sqrt(mean(positive^2)) per cell.
+    Stores two arrays per cell:
+      - proc.smooth_dfdt.S      = raw Gaussian-smoothed derivative (no shaping)
+      - proc.smooth_dfdt.S_proc = S + normalize/rectify/threshold (the GUI shaping)
+    proc.smooth_dfdt_std is sqrt(mean(positive^2)) of the shaped (S_proc) trace.
     """
     from caiman_sorter_py.core.state import get_init_param
     fr = float(get_init_param(est.init_params_caiman, "fr", 30))
@@ -201,8 +217,9 @@ def run_smooth_dfdt(est, proc, ops,
     cells = np.asarray(cells, dtype=int)
 
     data = est.C[cells] + est.YrA[cells]
-    out  = compute_smooth_dfdt(data, fr, ops.smooth_dfdt)
-    out  = apply_smooth_dfdt_threshold(out, ops.smooth_dfdt)
+    raw  = compute_smooth_dfdt_raw(data, fr, ops.smooth_dfdt)
+    proc_out = apply_smooth_dfdt_threshold(
+        compute_smooth_dfdt(data, fr, ops.smooth_dfdt), ops.smooth_dfdt)
 
     _ensure_lists(proc.smooth_dfdt, n_cells_total)
     if proc.smooth_dfdt_std is None or len(proc.smooth_dfdt_std) != n_cells_total:
@@ -210,8 +227,9 @@ def run_smooth_dfdt(est, proc, ops,
 
     for i, n in enumerate(cells):
         n = int(n)
-        proc.smooth_dfdt.S[n] = out[i].astype(np.float32, copy=False)
-        pos = out[i][out[i] > 0]
+        proc.smooth_dfdt.S[n]      = raw[i].astype(np.float32, copy=False)
+        proc.smooth_dfdt.S_proc[n] = proc_out[i].astype(np.float32, copy=False)
+        pos = proc_out[i][proc_out[i] > 0]
         proc.smooth_dfdt_std[n] = float(np.sqrt(np.mean(pos**2))) if pos.size else 0.0
 
     if log_cb:
@@ -321,6 +339,37 @@ def _pick_gd_slow_decay(g: np.ndarray) -> float:
     return float(np.max(np.real(roots)))
 
 
+def _foopsi_smooth(sp: np.ndarray, params, fr: float) -> np.ndarray:
+    """Apply the foopsi 'Smooth S' Gaussian to a raw spike train.
+
+    Mirrors the display smoothing in ui/trace_panel (sigma in ms → frames via
+    the frame rate). Returns a plain copy when smoothing is off.
+    """
+    sp = np.asarray(sp, dtype=float)
+    if params.smooth_s and params.smooth_sigma > 0:
+        sigma_frames = max(params.smooth_sigma * fr / 1000.0, 0.5)
+        return gaussian_filter1d(sp, sigma=sigma_frames, mode="reflect")
+    return sp
+
+
+def refresh_foopsi_proc(est, proc, ops) -> None:
+    """Recompute proc.foopsi.S_proc from the stored raw spikes + current params.
+
+    Cheap (no solver re-run) — used at save time so the persisted shaped trace
+    reflects the latest "Smooth S" setting without re-deconvolving.
+    """
+    from caiman_sorter_py.core.state import get_init_param
+    fr = float(get_init_param(est.init_params_caiman, "fr", 30))
+    n_cells_total = est.A.shape[1]
+    _ensure_lists(proc.foopsi, n_cells_total)
+    for n in range(n_cells_total):
+        s = proc.foopsi.S[n]
+        if s is None:
+            continue
+        proc.foopsi.S_proc[n] = _foopsi_smooth(s, ops.foopsi, fr).astype(
+            np.float32, copy=False)
+
+
 def run_foopsi(est, proc, ops,
                cells: Optional[np.ndarray] = None,
                log_cb: Optional[Callable[[str], None]] = None,
@@ -416,6 +465,7 @@ def run_foopsi(est, proc, ops,
             continue
         proc.foopsi.C[n] = c.astype(np.float32, copy=False)
         proc.foopsi.S[n] = sp.astype(np.float32, copy=False)
+        proc.foopsi.S_proc[n] = _foopsi_smooth(sp, fp, fr).astype(np.float32, copy=False)
         proc.foopsi.g[n] = g_out
         n_ok += 1
 

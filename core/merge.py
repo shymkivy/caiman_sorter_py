@@ -518,8 +518,9 @@ def _batch_append_merged_cells(est, proc, records: list[dict]) -> list[int]:
 
     # ---- DeconvResults lists ----------------------------------------------
     target = int(proc.num_cells)
-    for lst in (proc.smooth_dfdt.S, proc.smooth_dfdt.C, proc.smooth_dfdt.g,
-                proc.foopsi.S, proc.foopsi.C, proc.foopsi.g):
+    for lst in (proc.smooth_dfdt.S, proc.smooth_dfdt.S_proc,
+                proc.smooth_dfdt.C, proc.smooth_dfdt.g,
+                proc.foopsi.S, proc.foopsi.S_proc, proc.foopsi.C, proc.foopsi.g):
         while len(lst) < target:
             lst.append(None)
     if proc.smooth_dfdt_std is not None and len(proc.smooth_dfdt_std) < target:
@@ -528,7 +529,10 @@ def _batch_append_merged_cells(est, proc, records: list[dict]) -> list[int]:
             np.zeros(target - len(proc.smooth_dfdt_std)),
         ])
     for new_idx, r in zip(new_indices, records):
-        proc.foopsi.S[new_idx] = r["sp_new"].astype(np.float32)
+        sp_new = r["sp_new"].astype(np.float32)
+        proc.foopsi.S[new_idx] = sp_new
+        # No display smoothing re-applied at merge time → S_proc == raw here.
+        proc.foopsi.S_proc[new_idx] = sp_new
         proc.foopsi.C[new_idx] = r["c_new"].astype(np.float32)
         proc.foopsi.g[new_idx] = r["g_new"]
 
@@ -602,8 +606,9 @@ def reset_all_merges(est, proc) -> int:
             setattr(proc, name, v[:n_orig])
 
     # ---- Truncate DeconvResults lists -------------------------------------
-    for lst in (proc.smooth_dfdt.S, proc.smooth_dfdt.C, proc.smooth_dfdt.g,
-                proc.foopsi.S,      proc.foopsi.C,      proc.foopsi.g):
+    for lst in (proc.smooth_dfdt.S, proc.smooth_dfdt.S_proc,
+                proc.smooth_dfdt.C, proc.smooth_dfdt.g,
+                proc.foopsi.S, proc.foopsi.S_proc, proc.foopsi.C, proc.foopsi.g):
         del lst[n_orig:]
 
     # ---- Restore parents to auto-eval state -------------------------------

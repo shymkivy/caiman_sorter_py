@@ -117,16 +117,20 @@ def tiny_session():
         tauAR1=rng.uniform(0.3, 0.6, n_cells),
         tauAR2=rng.uniform(0.05, 0.5, (n_cells, 2)),
         smooth_dfdt=DeconvResults(
-            S=[None] * n_cells, C=[None] * n_cells, g=[None] * n_cells,
+            S=[None] * n_cells, S_proc=[None] * n_cells,
+            C=[None] * n_cells, g=[None] * n_cells,
         ),
         foopsi=DeconvResults(
-            S=[None] * n_cells, C=[None] * n_cells, g=[None] * n_cells,
+            S=[None] * n_cells, S_proc=[None] * n_cells,
+            C=[None] * n_cells, g=[None] * n_cells,
         ),
         smooth_dfdt_std=rng.uniform(0.01, 0.1, n_cells),
     )
 
     # Mark cell 2 as having a foopsi result so we exercise the populated-row path.
+    # Give S_proc a distinct value so the raw/shaped split round-trips separately.
     proc.foopsi.S[2] = rng.standard_normal(n_frames)
+    proc.foopsi.S_proc[2] = rng.standard_normal(n_frames)
     proc.foopsi.C[2] = rng.standard_normal(n_frames)
     proc.foopsi.g[2] = np.array([0.94, -0.08])
 

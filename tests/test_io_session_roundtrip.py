@@ -95,10 +95,12 @@ def test_packed_deconv_roundtrip(saved_path):
     for i in range(proc.num_cells):
         if proc.foopsi.S[i] is None:
             assert proc2.foopsi.S[i] is None, f"cell {i} S leaked"
+            assert proc2.foopsi.S_proc[i] is None, f"cell {i} S_proc leaked"
             assert proc2.foopsi.C[i] is None, f"cell {i} C leaked"
             assert proc2.foopsi.g[i] is None, f"cell {i} g leaked"
         else:
             assert np.allclose(proc2.foopsi.S[i], proc.foopsi.S[i])
+            assert np.allclose(proc2.foopsi.S_proc[i], proc.foopsi.S_proc[i])
             assert np.allclose(proc2.foopsi.C[i], proc.foopsi.C[i])
             assert np.allclose(proc2.foopsi.g[i], proc.foopsi.g[i])
 

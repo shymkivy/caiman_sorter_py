@@ -202,6 +202,11 @@ def test_initialize_proc_seeds_smooth_dfdt(tiny_session):
         assert s.shape == (est.C.shape[1],), f"cell {i}: {s.shape}"
     # …and at least one cell is non-zero (synthetic traces have signal).
     assert any(np.any(proc.smooth_dfdt.S[i] != 0) for i in range(n_cells))
+    # S_proc is populated alongside S (default Ops applies no shaping, so the
+    # two are equal here — the split is exercised in test_deconv).
+    assert len(proc.smooth_dfdt.S_proc) == n_cells
+    for i in range(n_cells):
+        assert proc.smooth_dfdt.S_proc[i] is not None, f"cell {i} S_proc is None"
     # std vector is sized and finite.
     assert proc.smooth_dfdt_std is not None
     assert proc.smooth_dfdt_std.shape == (n_cells,)
