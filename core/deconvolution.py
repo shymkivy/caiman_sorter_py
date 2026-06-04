@@ -263,9 +263,8 @@ def solver_available(solver: str) -> bool:
 def _check_solver_available(solver: str) -> None:
     """Raise a friendly ImportError if the solver's dependencies are missing."""
     if solver == "oasis":
-        try:
-            import caiman.source_extraction.cnmf.deconvolution as _  # noqa: F401
-        except ImportError:
+        import importlib.util
+        if importlib.util.find_spec("caiman") is None:
             raise ImportError(
                 "oasis solver requires CaImAn. "
                 "Install CaImAn: https://github.com/flatironinstitute/CaImAn#installation"

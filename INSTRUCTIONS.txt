@@ -1,5 +1,5 @@
 ====================================================
- CaImAn Sorter (Python) v1.03 — Installation & Usage
+ CaImAn Sorter (Python) v1.04 — Installation & Usage
 ====================================================
 
 A PyQt5 GUI for sorting/curating CaImAn CNMF outputs. Python port of
@@ -72,7 +72,7 @@ Run from the directory that CONTAINS the caiman_sorter_py folder
 For example, if you cloned into  ~/code  (so that
 ~/code/caiman_sorter_py exists), then  cd ~/code  and run the command.
 
-The window title shows the version (e.g. "CaImAn Sorter v1.03").
+The window title shows the version (e.g. "CaImAn Sorter v1.04").
 
 
 SUPPORTED FILE FORMATS
@@ -139,6 +139,8 @@ caiman_sorter_py/
   __init__.py            __version__ (single source of truth)
   __main__.py            entry point (python -m caiman_sorter_py)
   app.py                 QApplication bootstrap
+  requirements.txt       pip dependencies
+  pytest.ini             test runner config
   CLAUDE.md              architecture notes for Claude Code
   INSTRUCTIONS.txt       this file
   io/
@@ -166,7 +168,7 @@ SAVED FILE LAYOUT
 -----------------
 Both .h5 file types carry HDF5 root attributes:
   format       — "caiman_sorter_session" or "caiman_sorter_ops"
-  app_version  — e.g. "1.03"
+  app_version  — e.g. "1.04"
   saved_at     — ISO timestamp
 
 Full sessions also store the source CaImAn path under source_path.
