@@ -17,14 +17,28 @@ A working environment is the `caiman` conda env that ships with CaImAn:
 conda activate caiman
 ```
 
+## Download
+
+The app is run as a Python module named `caiman_sorter_py`, so the folder **must be named exactly `caiman_sorter_py`**. The easiest way to get that is `git clone`:
+
+```
+git clone https://github.com/shymkivy/caiman_sorter_py
+```
+
+This creates a folder called `caiman_sorter_py` (correct name, easy to update later with `git pull`).
+
+> **No git?** You can use GitHub's **Code → Download ZIP** instead — but the ZIP unpacks to a folder called `caiman_sorter_py-master`. **Rename it to `caiman_sorter_py`** before running, otherwise the `python -m caiman_sorter_py` command below won't find it.
+
 ## Usage
 
-Run from the **parent** directory of the package:
+Run from the directory that **contains** the `caiman_sorter_py` folder — i.e. its parent, *not* from inside it:
 
 ```
-cd <repo>/..
+cd path/to/parent      # the folder that holds caiman_sorter_py
 python -m caiman_sorter_py
 ```
+
+For example, if you cloned into `~/code`, then `cd ~/code` (so that `~/code/caiman_sorter_py` exists) and run the command.
 
 1. **Browse** to a CaImAn `*.hdf5` or a sort `*.h5` / `*.mat`, then click **Load**.
 2. Review cells; toggle accept/reject via right-click on the ROI maps or via the Accept/Reject buttons; tune thresholds in the Evaluation panel and click **Evaluate All**.

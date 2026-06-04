@@ -1,9 +1,10 @@
 ====================================================
- CaImAn Sorter (Python) v1.00 — Installation & Usage
+ CaImAn Sorter (Python) v1.03 — Installation & Usage
 ====================================================
 
 A PyQt5 GUI for sorting/curating CaImAn CNMF outputs. Python port of
-the MATLAB caiman_sorter pipeline (../caiman_sorter/).
+the MATLAB caiman_sorter pipeline:
+  https://github.com/shymkivy/caiman_sorter
 
 
 REQUIREMENTS
@@ -28,15 +29,34 @@ INSTALLATION
     hdf5storage is only used for MATLAB v7.3 .mat export/import.)
 
 
+DOWNLOAD
+--------
+The app runs as a Python module named "caiman_sorter_py", so the
+folder MUST be named exactly "caiman_sorter_py". The easiest way to
+get that is with git:
+
+     git clone https://github.com/shymkivy/caiman_sorter_py
+
+This creates a folder named "caiman_sorter_py" (correct name, and you
+can update later with "git pull").
+
+No git? Use GitHub's "Code > Download ZIP" instead -- but the ZIP
+unpacks to a folder named "caiman_sorter_py-master". RENAME it to
+"caiman_sorter_py" before running, or the command below won't find it.
+
+
 RUNNING THE GUI
 ---------------
-The caiman_sorter_py folder lives inside the caiman_sorter repo. Run
-from the parent directory:
+Run from the directory that CONTAINS the caiman_sorter_py folder
+(its parent), NOT from inside it:
 
-     cd C:\Users\ys2605\Desktop\stuff\caiman_sorter
+     cd path/to/parent          (the folder that holds caiman_sorter_py)
      python -m caiman_sorter_py
 
-The window title shows the version (e.g. "CaImAn Sorter v1.00").
+For example, if you cloned into  ~/code  (so that
+~/code/caiman_sorter_py exists), then  cd ~/code  and run the command.
+
+The window title shows the version (e.g. "CaImAn Sorter v1.03").
 
 
 SUPPORTED FILE FORMATS
@@ -130,7 +150,7 @@ SAVED FILE LAYOUT
 -----------------
 Both .h5 file types carry HDF5 root attributes:
   format       — "caiman_sorter_session" or "caiman_sorter_ops"
-  app_version  — e.g. "1.00"
+  app_version  — e.g. "1.03"
   saved_at     — ISO timestamp
 
 Full sessions also store the source CaImAn path under source_path.
