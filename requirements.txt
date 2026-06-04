@@ -4,3 +4,6 @@ numpy>=1.21
 scipy>=1.7
 h5py>=3.0
 scikit-image>=0.19
+scikit-learn>=1.0
+hdf5storage>=0.1.19
+joblib>=1.3

@@ -9,13 +9,15 @@ PyQt5 GUI to manually curate cells extracted by [CaImAn](https://github.com/flat
 ## Requirements
 
 - **Python 3.9+** (developed against 3.11).
-- **PyQt5**, **h5py**, **scipy**, **numpy**, **hdf5storage**, **scikit-learn**, **joblib**.
-- **CaImAn** (vendored OASIS deconvolution lives in `caiman.source_extraction.cnmf.deconvolution`).
+- **CaImAn** — required for constrained-foopsi/OASIS deconvolution and for computing contours on load (vendored OASIS lives in `caiman.source_extraction.cnmf.deconvolution`).
+- The Python packages listed in `requirements.txt`: `PyQt5`, `matplotlib`, `numpy`, `scipy`, `h5py`, `scikit-image`, `scikit-learn`, `hdf5storage`, `joblib`.
 
-A working environment is the `caiman` conda env that ships with CaImAn:
+The simplest setup is the `caiman` conda env that ships with CaImAn, then install the rest with pip:
 ```
 conda activate caiman
+pip install -r requirements.txt
 ```
+Run the `pip install` from inside the `caiman_sorter_py` folder (where `requirements.txt` lives), or pass the full path to it.
 
 ## Download
 

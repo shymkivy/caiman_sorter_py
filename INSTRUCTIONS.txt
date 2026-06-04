@@ -20,11 +20,13 @@ INSTALLATION
 
      conda activate caiman
 
-2. Install the additional Python packages this GUI needs:
+2. Install the additional Python packages this GUI needs. From inside
+   the caiman_sorter_py folder (where requirements.txt lives):
 
-     pip install PyQt5 matplotlib numpy scipy h5py scikit-image \
-                 scikit-learn hdf5storage joblib
+     pip install -r requirements.txt
 
+   That installs: PyQt5, matplotlib, numpy, scipy, h5py, scikit-image,
+   scikit-learn, hdf5storage, joblib.
    (scikit-learn is only used by the NMF merge method;
     hdf5storage is only used for MATLAB v7.3 .mat export/import.)
 
