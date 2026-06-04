@@ -35,10 +35,6 @@ conda activate caiman_sorter
 pip install -r requirements.txt
 ```
 
-(Or use a plain `python -m venv` instead of conda — only the Python version + `requirements.txt` matter here.)
-
-If you later want constrained foopsi in this env, install CaImAn into it following [CaImAn's instructions](https://github.com/flatironinstitute/CaImAn#installation).
-
 > Run the `pip install` from inside the `caiman_sorter_py` folder (where `requirements.txt` lives), or pass the full path to it.
 
 ## Download
