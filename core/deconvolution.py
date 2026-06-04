@@ -245,7 +245,7 @@ def run_smooth_dfdt(est, proc, ops,
 _VALID_SOLVERS = ("oasis", "cvxpy", "cvx")
 
 SOLVER_INSTALL_HINT = {
-    "oasis": "",                                    # always available with caiman
+    "oasis": "Install CaImAn: https://github.com/flatironinstitute/CaImAn#installation",
     "cvxpy": "pip install cvxpy",
     "cvx":   "pip install cvxopt picos",
 }
@@ -263,7 +263,13 @@ def solver_available(solver: str) -> bool:
 def _check_solver_available(solver: str) -> None:
     """Raise a friendly ImportError if the solver's dependencies are missing."""
     if solver == "oasis":
-        return                       # ships with caiman
+        try:
+            import caiman.source_extraction.cnmf.deconvolution as _  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "oasis solver requires CaImAn. "
+                "Install CaImAn: https://github.com/flatironinstitute/CaImAn#installation"
+            )
     if solver == "cvxpy":
         try:
             import cvxpy as _        # noqa: F401
