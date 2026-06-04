@@ -9,15 +9,37 @@ PyQt5 GUI to manually curate cells extracted by [CaImAn](https://github.com/flat
 ## Requirements
 
 - **Python 3.9+** (developed against 3.11).
-- **CaImAn** — required for constrained-foopsi/OASIS deconvolution and for computing contours on load (vendored OASIS lives in `caiman.source_extraction.cnmf.deconvolution`).
 - The Python packages listed in `requirements.txt`: `PyQt5`, `matplotlib`, `numpy`, `scipy`, `h5py`, `scikit-image`, `scikit-learn`, `hdf5storage`, `joblib`.
+- **CaImAn** — **only** needed for **constrained-foopsi** deconvolution (all three solvers route through `caiman.source_extraction.cnmf.deconvolution.constrained_foopsi`). Everything else — loading, sorting, evaluation, merging, **smooth dF/dt** deconvolution, and save/`.mat` export — runs without it.
 
-The simplest setup is the `caiman` conda env that ships with CaImAn, then install the rest with pip:
+CaImAn is the only heavyweight dependency and is not cleanly pip-installable, so there are two ways to set up. Either works:
+
+### Option A — reuse your existing `caiman` env (full functionality)
+
+If you already have a `caiman` conda env (the one that ships with CaImAn), just add this app's extra packages to it:
+
 ```
 conda activate caiman
 pip install -r requirements.txt
 ```
-Run the `pip install` from inside the `caiman_sorter_py` folder (where `requirements.txt` lives), or pass the full path to it.
+
+This gives you everything, including constrained-foopsi deconvolution.
+
+### Option B — make a fresh, lightweight env (no CaImAn)
+
+If you don't have CaImAn (or don't want to pull it in), create a minimal env. You get the whole app **except** constrained-foopsi deconvolution — smooth dF/dt still works.
+
+```
+conda create -n caiman_sorter python=3.11
+conda activate caiman_sorter
+pip install -r requirements.txt
+```
+
+(Or use a plain `python -m venv` instead of conda — only the Python version + `requirements.txt` matter here.)
+
+If you later want constrained foopsi in this env, install CaImAn into it following [CaImAn's instructions](https://github.com/flatironinstitute/CaImAn#installation).
+
+> Run the `pip install` from inside the `caiman_sorter_py` folder (where `requirements.txt` lives), or pass the full path to it.
 
 ## Download
 
