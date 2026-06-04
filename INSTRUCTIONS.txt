@@ -10,25 +10,39 @@ the MATLAB caiman_sorter pipeline:
 REQUIREMENTS
 ------------
 - Python 3.9 or later (Anaconda/Miniconda recommended)
-- CaImAn Python (required for the foopsi/OASIS deconvolution and for
-  computing spatial contours on load)
+- The Python packages in requirements.txt: PyQt5, matplotlib, numpy,
+  scipy, h5py, scikit-image, scikit-learn, hdf5storage, joblib.
+  (scikit-learn is only used by the NMF merge method;
+   hdf5storage is only used for MATLAB v7.3 .mat export/import.)
+- CaImAn Python -- ONLY needed for constrained-foopsi deconvolution.
+  Everything else (loading, sorting, evaluation, merging, smooth dF/dt
+  deconvolution, save/.mat export) runs without it.
 
 
 INSTALLATION
 ------------
-1. Activate the conda environment that has CaImAn installed:
+CaImAn is the only heavyweight dependency and is not cleanly
+pip-installable, so there are two ways to set up. Either works.
+
+Run the "pip install" step from inside the caiman_sorter_py folder
+(where requirements.txt lives), or pass the full path to it.
+
+Option A -- reuse your existing "caiman" env (full functionality)
+  If you already have the conda env that ships with CaImAn, just add
+  this app's extra packages to it:
 
      conda activate caiman
-
-2. Install the additional Python packages this GUI needs. From inside
-   the caiman_sorter_py folder (where requirements.txt lives):
-
      pip install -r requirements.txt
 
-   That installs: PyQt5, matplotlib, numpy, scipy, h5py, scikit-image,
-   scikit-learn, hdf5storage, joblib.
-   (scikit-learn is only used by the NMF merge method;
-    hdf5storage is only used for MATLAB v7.3 .mat export/import.)
+  This gives you everything, including constrained-foopsi deconvolution.
+
+Option B -- make a fresh, lightweight env (no CaImAn)
+  Creates a minimal env. You get the whole app EXCEPT constrained-foopsi
+  deconvolution -- smooth dF/dt still works.
+
+     conda create -n caiman_sorter python=3.11
+     conda activate caiman_sorter
+     pip install -r requirements.txt
 
 
 DOWNLOAD
